@@ -1,0 +1,10 @@
+accounts.json
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+fatal_error.log
+*.stop
+*.session.json

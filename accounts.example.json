@@ -1,0 +1,24 @@
+{
+  "_comment": "Account config template (DO NOT commit real private keys).",
+  "_warning": "Keep this file safe. Never publish real private keys to GitHub.",
+  "accounts": [
+    {
+      "name": "w01",
+      "my_address": "0xYOUR_WALLET_ADDRESS",
+      "private_key": "0xYOUR_PRIVATE_KEY",
+      "follow_ratio": 0.1,
+      "enabled": true,
+      "max_notional_per_token": 10000,
+      "max_notional_total": 10000
+    },
+    {
+      "name": "w02",
+      "my_address": "0xYOUR_WALLET_ADDRESS_2",
+      "private_key": "0xYOUR_PRIVATE_KEY_2",
+      "follow_ratio": 0.1,
+      "enabled": true,
+      "max_notional_per_token": 10000,
+      "max_notional_total": 10000
+    }
+  ]
+}
