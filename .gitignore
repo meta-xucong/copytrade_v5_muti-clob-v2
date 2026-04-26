@@ -1,4 +1,9 @@
 accounts.json
+accounts.node_*.json
+accounts_by_proxy/
+instances/proxy_instances.json
+instances/clash_listeners.json
+instances/clash_nodes.current.txt
 logs/
 __pycache__/
 .pytest_cache/

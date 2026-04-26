@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to clash_listeners.json. Fill proxy with exact node names from clash_nodes.current.txt.",
+  "profile_path": "",
+  "listeners": [
+    {
+      "name": "copytrade-node-a",
+      "listen": "127.0.0.1",
+      "port": 17891,
+      "proxy": "PASTE_EXACT_PRIMARY_NODE_NAME_FOR_NODE_A",
+      "backups": [
+        "PASTE_EXACT_BACKUP_NODE_NAME_FOR_NODE_A"
+      ]
+    },
+    {
+      "name": "copytrade-node-b",
+      "listen": "127.0.0.1",
+      "port": 17892,
+      "proxy": "PASTE_EXACT_PRIMARY_NODE_NAME_FOR_NODE_B",
+      "backups": [
+        "PASTE_EXACT_BACKUP_NODE_NAME_FOR_NODE_B"
+      ]
+    }
+  ]
+}
