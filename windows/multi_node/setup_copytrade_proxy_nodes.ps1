@@ -32,7 +32,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$root = Split-Path -Parent $scriptDir
+$windowsDir = Split-Path -Parent $scriptDir
+$root = Split-Path -Parent $windowsDir
 Set-Location $root
 
 function Get-ActiveClashProfilePath {

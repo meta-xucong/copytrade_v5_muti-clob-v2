@@ -61,7 +61,7 @@ The recommended copytrade listener ports start at `17891` to avoid CFW defaults 
 Export the exact node names from the active Clash profile:
 
 ```powershell
-.\windows\export_clash_nodes.ps1
+.\windows\multi_node\export_clash_nodes.ps1
 ```
 
 This writes:
@@ -86,27 +86,21 @@ Copy `instances/clash_listeners.example.json` to `instances/clash_listeners.json
 }
 ```
 
-The legacy listener apply helper still exists for experiments:
-
-```powershell
-.\windows\apply_clash_listeners.ps1 -CheckOnly
-.\windows\apply_clash_listeners.ps1
-```
-
-The apply script backs up the active profile before writing.
+The legacy listener apply helper has been removed from the day-to-day Windows
+tooling. Use sidecar cores for normal operation.
 
 Use isolated sidecar cores for normal operation. This leaves the main Clash for Windows VPN on `7890` untouched:
 
 ```powershell
-.\windows\start_copytrade_clash_cores.ps1
-.\windows\status_copytrade_clash_cores.ps1
-.\windows\stop_copytrade_clash_cores.ps1
+.\windows\multi_node\start_copytrade_clash_cores.ps1
+.\windows\multi_node\status_copytrade_clash_cores.ps1
+.\windows\multi_node\stop_copytrade_clash_cores.ps1
 ```
 
 For a fresh machine, prefer the standardized one-command setup:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1
 ```
 
 It lists nodes and asks the user which ones to use.
@@ -114,7 +108,7 @@ It lists nodes and asks the user which ones to use.
 You can specify one backup per selected node:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 `
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 `
   -Nodes "香港A01,香港A02,香港A03,香港A04,香港A05" `
   -BackupNodes "香港A06,香港A07,香港A08,香港A09,香港A10" `
   -AccountsDir ".\accounts_by_proxy"
@@ -141,33 +135,33 @@ logs/copytrade-node-02/
 From the project root:
 
 ```powershell
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-02
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-02
 ```
 
 For dry-run:
 
 ```powershell
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -Mode dry
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -Mode dry
 ```
 
 For a preflight-only check without launching:
 
 ```powershell
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -CheckOnly
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -CheckOnly
 ```
 
 For script-only validation before Clash listeners are configured:
 
 ```powershell
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -InstancesConfig .\instances\proxy_instances.example.json -CheckOnly -SkipProxyPortCheck -SkipExitIpCheck
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -InstancesConfig .\instances\proxy_instances.example.json -CheckOnly -SkipProxyPortCheck -SkipExitIpCheck
 ```
 
 ## Stop And Status
 
 ```powershell
-.\windows\status_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
-.\windows\stop_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
+.\windows\multi_node\status_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
+.\windows\multi_node\stop_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
 ```
 
 The scripts read the same `instances/proxy_instances.json` file by default.
@@ -199,12 +193,12 @@ The proxy port check also blocks launch by default. Use `-SkipProxyPortCheck` on
 Stop all proxy instances:
 
 ```powershell
-.\windows\stop_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
-.\windows\stop_copytrade_proxy_instance.ps1 -Instance copytrade-node-02
+.\windows\multi_node\stop_copytrade_proxy_instance.ps1 -Instance copytrade-node-01
+.\windows\multi_node\stop_copytrade_proxy_instance.ps1 -Instance copytrade-node-02
 ```
 
 Then use the original launcher:
 
 ```powershell
-.\windows\start_copytrade_live_supervised.ps1
+.\windows\single_node\start_copytrade_live_supervised.ps1
 ```

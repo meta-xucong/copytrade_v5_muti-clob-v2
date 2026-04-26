@@ -7,7 +7,7 @@ This is the portable one-command flow for a Windows machine that has Clash for W
 Start Clash first, then run:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1
 ```
 
 The script will:
@@ -26,7 +26,7 @@ The script will:
 Create the default five generic account group files:
 
 ```powershell
-.\windows\init_proxy_account_groups.ps1
+.\windows\multi_node\init_proxy_account_groups.ps1
 ```
 
 Prepare one account JSON per selected proxy node. Put them in a folder and name them so alphabetical order is the intended matching order:
@@ -43,13 +43,13 @@ accounts_by_proxy/
 Run:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 -Nodes "1,3,5,7,9" -AccountsDir ".\accounts_by_proxy"
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 -Nodes "1,3,5,7,9" -AccountsDir ".\accounts_by_proxy"
 ```
 
 Add one backup node per selected node:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 `
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 `
   -Nodes "1,3,5,7,9" `
   -BackupNodes "11,13,15,17,19" `
   -AccountsDir ".\accounts_by_proxy"
@@ -58,7 +58,7 @@ Add one backup node per selected node:
 Backup nodes are matched by order. The first backup belongs to the first selected node, the second backup belongs to the second selected node, and so on. Use semicolons if one selected node has more than one backup:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 `
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 `
   -Nodes "1,3" `
   -BackupNodes "11+13;15+17" `
   -AccountsDir ".\accounts_by_proxy"
@@ -84,7 +84,7 @@ instances/proxy_instances.json
 You can also pass account files explicitly:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 `
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 `
   -Nodes "1,3,5" `
   -AccountFiles ".\accounts_by_proxy\group-01.json,.\accounts_by_proxy\group-02.json,.\accounts_by_proxy\group-03.json"
 ```
@@ -96,13 +96,13 @@ The number of selected nodes must equal the number of account JSON files.
 Use node indexes:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 -Nodes "1,3,5,7,9"
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 -Nodes "1,3,5,7,9"
 ```
 
 Use unique node keywords:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 -Nodes "A01,A02,A03"
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 -Nodes "A01,A02,A03"
 ```
 
 Default ports start at `17891`, so five selected nodes become:
@@ -120,7 +120,7 @@ Default ports start at `17891`, so five selected nodes become:
 If automatic discovery fails:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 `
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 `
   -ProfilePath "C:\path\to\config.yaml" `
   -ClashCorePath "C:\path\to\mihomo.exe"
 ```
@@ -128,26 +128,36 @@ If automatic discovery fails:
 To only generate mappings without starting cores:
 
 ```powershell
-.\windows\setup_copytrade_proxy_nodes.ps1 -Nodes "1,3,5" -AccountsDir ".\accounts_by_proxy" -NoStart
+.\windows\multi_node\setup_copytrade_proxy_nodes.ps1 -Nodes "1,3,5" -AccountsDir ".\accounts_by_proxy" -NoStart
 ```
 
 ## Manage Cores
 
 ```powershell
-.\windows\status_copytrade_clash_cores.ps1
-.\windows\stop_copytrade_clash_cores.ps1
-.\windows\start_copytrade_clash_cores.ps1
+.\windows\multi_node\status_copytrade_clash_cores.ps1
+.\windows\multi_node\stop_copytrade_clash_cores.ps1
+.\windows\multi_node\start_copytrade_clash_cores.ps1
 ```
 
 These sidecar cores do not change the user's main Clash GUI selected node.
 
 ## Start Copytrade Instances
 
+For day-to-day use, prefer the organized entrypoints:
+
+```powershell
+cd .\windows\entrypoints
+.\multi_node_5.ps1 -Action check -Mode dry
+.\multi_node_5.ps1 -Action start -Mode dry
+.\multi_node_5.ps1 -Action status
+.\multi_node_5.ps1 -Action stop
+```
+
 After node/account binding is generated:
 
 ```powershell
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -Mode dry
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-02 -Mode dry
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -Mode dry
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-02 -Mode dry
 ```
 
 Use the instance names printed in `instances/proxy_instances.json`.

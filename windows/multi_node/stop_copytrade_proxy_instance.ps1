@@ -2,13 +2,16 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Instance,
 
-    [string]$InstancesConfig = ""
+    [string]$InstancesConfig = "",
+
+    [int]$WaitSec = 20
 )
 
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$root = Split-Path -Parent $scriptDir
+$windowsDir = Split-Path -Parent $scriptDir
+$root = Split-Path -Parent $windowsDir
 Set-Location $root
 
 if (-not $InstancesConfig) {
@@ -16,6 +19,18 @@ if (-not $InstancesConfig) {
 }
 if (-not (Test-Path -LiteralPath $InstancesConfig)) {
     throw "Instances config not found: $InstancesConfig"
+}
+
+function Get-PythonCommand {
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        return @("py", "-3")
+    }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        return @("python")
+    }
+    throw "Python launcher not found. Please install Python or add it to PATH."
 }
 
 $payload = Get-Content -LiteralPath $InstancesConfig -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -28,19 +43,17 @@ $prefix = [string]$(if ($selected.prefix) { $selected.prefix } else { "persisten
 $sessionName = [string]$(if ($selected.session_name) { $selected.session_name } else { "$prefix`_session.json" })
 $sessionPath = Join-Path $root ("logs\" + $sessionName)
 
-if (-not (Test-Path -LiteralPath $sessionPath)) {
-    Write-Host "Session not found: $sessionPath" -ForegroundColor Yellow
-    exit 0
-}
+$pycmd = Get-PythonCommand
+$args = @(
+    "$root\persistent_copytrade_runner.py",
+    "stop",
+    "--workdir", $root,
+    "--session", $sessionPath,
+    "--wait-sec", "$WaitSec"
+)
 
-$session = Get-Content -LiteralPath $sessionPath -Raw -Encoding UTF8 | ConvertFrom-Json
-Write-Host "Instance: $Instance" -ForegroundColor Cyan
-Write-Host "Status: $($session.status)"
-Write-Host "Desired state: $($session.desired_state)"
-Write-Host "Session: $sessionPath"
-Write-Host "Supervisor PID: $($session.supervisor_pid)"
-Write-Host "Child PID: $($session.child_pid)"
-Write-Host "Restarts: $($session.restart_count)"
-Write-Host "Stdout: $($session.stdout)"
-Write-Host "Stderr: $($session.stderr)"
-Write-Host "Updated: $($session.updated_at)"
+$output = & $pycmd[0] $pycmd[1..($pycmd.Length - 1)] $args
+if ($LASTEXITCODE -ne 0) {
+    throw "Stop failed with exit code $LASTEXITCODE"
+}
+Write-Host $output

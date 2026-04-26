@@ -78,7 +78,7 @@ py -3 -m py_compile persistent_copytrade_runner.py copytrade_run.py
 Then validate script parsing and config generation:
 
 ```powershell
-.\windows\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -InstancesConfig .\instances\proxy_instances.example.json -CheckOnly -SkipExitIpCheck
+.\windows\multi_node\start_copytrade_proxy_instance.ps1 -Instance copytrade-node-01 -InstancesConfig .\instances\proxy_instances.example.json -CheckOnly -SkipExitIpCheck
 ```
 
 If Clash listener ports are not configured yet, include `-SkipProxyPortCheck`.
