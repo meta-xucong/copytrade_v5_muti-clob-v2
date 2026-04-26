@@ -1,0 +1,80 @@
+{
+  "_comment": "Example only. setup_copytrade_proxy_nodes.ps1 generates proxy_instances.json and binds selected nodes to account group files by order. Do not commit private keys.",
+  "instances": [
+    {
+      "name": "copytrade-node-01",
+      "enabled": true,
+      "base_config": "copytrade_config.json",
+      "accounts_file": "accounts_by_proxy/group-01.json",
+      "http_proxy": "http://127.0.0.1:17891",
+      "https_proxy": "http://127.0.0.1:17891",
+      "all_proxy": "http://127.0.0.1:17891",
+      "no_proxy": "127.0.0.1,localhost",
+      "log_dir": "logs/copytrade-node-01",
+      "prefix": "persistent_live_copytrade-node-01",
+      "session_name": "persistent_live_copytrade-node-01_session.json",
+      "poll": 20,
+      "mode": "live"
+    },
+    {
+      "name": "copytrade-node-02",
+      "enabled": true,
+      "base_config": "copytrade_config.json",
+      "accounts_file": "accounts_by_proxy/group-02.json",
+      "http_proxy": "http://127.0.0.1:17892",
+      "https_proxy": "http://127.0.0.1:17892",
+      "all_proxy": "http://127.0.0.1:17892",
+      "no_proxy": "127.0.0.1,localhost",
+      "log_dir": "logs/copytrade-node-02",
+      "prefix": "persistent_live_copytrade-node-02",
+      "session_name": "persistent_live_copytrade-node-02_session.json",
+      "poll": 20,
+      "mode": "live"
+    },
+    {
+      "name": "copytrade-node-03",
+      "enabled": true,
+      "base_config": "copytrade_config.json",
+      "accounts_file": "accounts_by_proxy/group-03.json",
+      "http_proxy": "http://127.0.0.1:17893",
+      "https_proxy": "http://127.0.0.1:17893",
+      "all_proxy": "http://127.0.0.1:17893",
+      "no_proxy": "127.0.0.1,localhost",
+      "log_dir": "logs/copytrade-node-03",
+      "prefix": "persistent_live_copytrade-node-03",
+      "session_name": "persistent_live_copytrade-node-03_session.json",
+      "poll": 20,
+      "mode": "live"
+    },
+    {
+      "name": "copytrade-node-04",
+      "enabled": true,
+      "base_config": "copytrade_config.json",
+      "accounts_file": "accounts_by_proxy/group-04.json",
+      "http_proxy": "http://127.0.0.1:17894",
+      "https_proxy": "http://127.0.0.1:17894",
+      "all_proxy": "http://127.0.0.1:17894",
+      "no_proxy": "127.0.0.1,localhost",
+      "log_dir": "logs/copytrade-node-04",
+      "prefix": "persistent_live_copytrade-node-04",
+      "session_name": "persistent_live_copytrade-node-04_session.json",
+      "poll": 20,
+      "mode": "live"
+    },
+    {
+      "name": "copytrade-node-05",
+      "enabled": true,
+      "base_config": "copytrade_config.json",
+      "accounts_file": "accounts_by_proxy/group-05.json",
+      "http_proxy": "http://127.0.0.1:17895",
+      "https_proxy": "http://127.0.0.1:17895",
+      "all_proxy": "http://127.0.0.1:17895",
+      "no_proxy": "127.0.0.1,localhost",
+      "log_dir": "logs/copytrade-node-05",
+      "prefix": "persistent_live_copytrade-node-05",
+      "session_name": "persistent_live_copytrade-node-05_session.json",
+      "poll": 20,
+      "mode": "live"
+    }
+  ]
+}
