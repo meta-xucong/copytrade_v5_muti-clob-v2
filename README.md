@@ -19,6 +19,7 @@ Polymarket copytrading bot migrated to CLOB V2, with phased gateway refactor, pU
 - `ct_state.py`: runtime state, cache, and preflight persistence
 - `bounded_copytrade_runner.py`: bounded session runner
 - `persistent_copytrade_runner.py`: long-running supervisor runner
+- `smartmoney_query/`: local Polymarket Data API helper package required by `copytrade_run.py` and `ct_data.py`
 - `sandbox_trade_smoke.py`: live sandbox trade smoke
 - `sandbox_restart_recovery_smoke.py`: restart recovery validation
 - `tests/`: unit and regression tests
@@ -28,6 +29,7 @@ Polymarket copytrading bot migrated to CLOB V2, with phased gateway refactor, pU
 ## Requirements
 
 - Python 3.11+
+- `requests`
 - Polygon-compatible funded test or production account
 - `py-clob-client-v2`
 - pUSD-ready Polymarket funder wallet for live order tests
