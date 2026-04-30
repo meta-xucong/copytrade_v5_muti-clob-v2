@@ -1802,16 +1802,68 @@ def apply_actions(
         if isinstance(lock_map, dict) and token_id in lock_map:
             lock_map.pop(token_id, None)
             logger.info("[SELL_LOCK_CLEAR] token_id=%s", token_id)
+
+    def _pending_buy_orders_mut() -> Dict[str, Any]:
+        if state is None:
+            return {}
+        pending = state.setdefault("pending_buy_orders", {})
+        if not isinstance(pending, dict):
+            state["pending_buy_orders"] = {}
+            pending = state["pending_buy_orders"]
+        return pending
+
+    def _record_pending_buy_order(
+        order_id: object,
+        token_id: str,
+        usd: float,
+        price_value: float,
+        size_value: float,
+    ) -> None:
+        if state is None or not order_id or not token_id or usd <= 0:
+            return
+        pending = _pending_buy_orders_mut()
+        pending[str(order_id)] = {
+            "token_id": str(token_id),
+            "usd": float(usd),
+            "price": float(price_value),
+            "size": float(size_value),
+            "ts": int(now_ts),
+        }
+        logger.info(
+            "[PENDING_BUY_RECORD] order_id=%s token_id=%s usd=%s",
+            order_id,
+            token_id,
+            usd,
+        )
+
+    def _clear_pending_buy_order(order_id: object, reason: str) -> None:
+        if state is None or not order_id:
+            return
+        pending = state.get("pending_buy_orders")
+        if not isinstance(pending, dict):
+            return
+        meta = pending.pop(str(order_id), None)
+        if isinstance(meta, dict):
+            logger.info(
+                "[PENDING_BUY_CLEAR] order_id=%s token_id=%s usd=%s reason=%s",
+                order_id,
+                meta.get("token_id"),
+                meta.get("usd"),
+                reason,
+            )
+
     for action in actions:
         if action.get("type") == "cancel":
             order_id = action.get("order_id")
             if not order_id:
                 continue
             if dry_run:
+                _clear_pending_buy_order(order_id, "dry_run_cancel")
                 updated = [o for o in updated if str(o.get("order_id")) != str(order_id)]
                 continue
             try:
                 cancel_order(client, str(order_id), api_timeout_sec)
+                _clear_pending_buy_order(order_id, "local_cancel")
                 updated = [o for o in updated if str(o.get("order_id")) != str(order_id)]
             except Exception as exc:
                 logger.warning("cancel_order failed order_id=%s: %s", order_id, exc)
@@ -2341,22 +2393,31 @@ def apply_actions(
                             "ts": int(now_ts),
                         }
                     )
-                # CRITICAL: Update buy notional accumulator (first line of defense)
-                accumulator = state.setdefault("buy_notional_accumulator", {})
-                if not isinstance(accumulator, dict):
-                    state["buy_notional_accumulator"] = {}
-                    accumulator = state["buy_notional_accumulator"]
-                if token_id not in accumulator:
-                    accumulator[token_id] = {"usd": 0.0, "last_ts": now_ts}
-                accumulator[token_id]["usd"] = float(accumulator[token_id].get("usd", 0.0)) + float(usd)
-                accumulator[token_id]["last_ts"] = int(now_ts)
-                logger.info(
-                    "[ACCUMULATOR_UPDATE] token_id=%s added_usd=%s total_usd=%s is_taker=%s",
-                    token_id,
-                    usd,
-                    accumulator[token_id]["usd"],
-                    executed_as_taker,
-                )
+                    # Taker/Fak BUY has no resting order to reconcile later, so it is
+                    # treated as confirmed local exposure until position sync catches up.
+                    accumulator = state.setdefault("buy_notional_accumulator", {})
+                    if not isinstance(accumulator, dict):
+                        state["buy_notional_accumulator"] = {}
+                        accumulator = state["buy_notional_accumulator"]
+                    if token_id not in accumulator:
+                        accumulator[token_id] = {"usd": 0.0, "last_ts": now_ts}
+                    accumulator[token_id]["usd"] = float(accumulator[token_id].get("usd", 0.0)) + float(usd)
+                    accumulator[token_id]["last_ts"] = int(now_ts)
+                    logger.info(
+                        "[ACCUMULATOR_UPDATE] token_id=%s added_usd=%s total_usd=%s is_taker=%s",
+                        token_id,
+                        usd,
+                        accumulator[token_id]["usd"],
+                        executed_as_taker,
+                    )
+                elif order_id:
+                    _record_pending_buy_order(
+                        order_id,
+                        token_id,
+                        usd,
+                        price,
+                        size_for_record,
+                    )
         if order_id:
             if state is not None:
                 token_id = str(action.get("token_id") or "")

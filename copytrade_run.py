@@ -1434,6 +1434,58 @@ def _reconcile_accumulator_for_account(
                 )
 
 
+def _reconcile_zero_position_accumulator(
+    state: Dict[str, Any],
+    token_id: str,
+    *,
+    my_shares: float,
+    open_orders: list[dict],
+    now_ts: int,
+    cfg: Dict[str, Any],
+    logger: logging.Logger,
+    eps: float,
+) -> bool:
+    if my_shares > eps or open_orders:
+        return False
+    accumulator = state.get("buy_notional_accumulator")
+    if not isinstance(accumulator, dict):
+        return False
+    acc_data = accumulator.get(token_id)
+    if not isinstance(acc_data, dict):
+        return False
+    acc_usd = float(acc_data.get("usd") or 0.0)
+    if acc_usd <= 0.5:
+        return False
+    reconcile_sec = int(cfg.get("accumulator_zero_reconcile_sec") or 300)
+    if reconcile_sec <= 0:
+        return False
+    last_ts = int(acc_data.get("last_ts") or 0)
+    if last_ts <= 0 or now_ts - last_ts < reconcile_sec:
+        return False
+    order_snapshot_ts = int(state.get("remote_order_snapshot_ts") or 0)
+    health = ensure_runtime_health(state)
+    components = health.get("components") if isinstance(health, dict) else {}
+    my_positions_ts = 0
+    if isinstance(components, dict):
+        my_component = components.get("data_api_my_positions")
+        if isinstance(my_component, dict):
+            my_positions_ts = int(my_component.get("last_success_ts") or 0)
+    if order_snapshot_ts <= 0 or order_snapshot_ts < last_ts:
+        return False
+    if my_positions_ts <= 0 or my_positions_ts < last_ts:
+        return False
+    accumulator.pop(token_id, None)
+    logger.warning(
+        "[ACCUMULATOR_RECONCILE_ZERO] token_id=%s old_usd=%s last_ts=%s order_snapshot_ts=%s my_positions_ts=%s reason=confirmed_zero_position_no_orders",
+        token_id,
+        acc_usd,
+        last_ts,
+        order_snapshot_ts,
+        my_positions_ts,
+    )
+    return True
+
+
 def _run_hemostasis_recovery_for_account(
     cfg: Dict[str, Any],
     data_client: Any,
@@ -2297,43 +2349,56 @@ def _calc_shadow_buy_notional(
 ) -> tuple[float, Dict[str, float]]:
     if ttl_sec <= 0:
         state["shadow_buy_orders"] = []
+        state["taker_buy_orders"] = []
         return 0.0, {}
-    taker_orders = state.get("taker_buy_orders")
-    shadow_orders = state.get("shadow_buy_orders")
-    if isinstance(taker_orders, list) and taker_orders:
-        orders_key = "taker_buy_orders"
-        shadow_orders = taker_orders
-    elif isinstance(shadow_orders, list) and shadow_orders:
-        orders_key = "shadow_buy_orders"
-    else:
-        orders_key = (
-            "taker_buy_orders" if isinstance(taker_orders, list) else "shadow_buy_orders"
-        )
-        shadow_orders = taker_orders if isinstance(taker_orders, list) else shadow_orders
-    if not isinstance(shadow_orders, list):
-        state[orders_key] = []
-        return 0.0, {}
-    kept: list[dict] = []
+
     total = 0.0
     by_token: Dict[str, float] = {}
-    for order in shadow_orders:
-        if not isinstance(order, dict):
-            continue
-        token_id = str(order.get("token_id") or "")
-        if not token_id:
-            continue
-        ts = int(order.get("ts") or 0)
-        if ts <= 0 or (now_ts - ts) > ttl_sec:
-            continue
-        usd = float(order.get("usd") or 0.0)
-        if usd <= 0:
-            continue
-        kept.append(order)
-        total += usd
-        by_token[token_id] = by_token.get(token_id, 0.0) + usd
-    state[orders_key] = kept
-    if orders_key == "shadow_buy_orders":
-        state["taker_buy_orders"] = list(kept)
+
+    def _collect_from_list(key: str) -> None:
+        nonlocal total
+        orders = state.get(key)
+        if not isinstance(orders, list):
+            state[key] = []
+            return
+        kept: list[dict] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            token_id = str(order.get("token_id") or "")
+            if not token_id:
+                continue
+            ts = int(order.get("ts") or 0)
+            if ts <= 0 or (now_ts - ts) > ttl_sec:
+                continue
+            usd = float(order.get("usd") or 0.0)
+            if usd <= 0:
+                continue
+            kept.append(order)
+            total += usd
+            by_token[token_id] = by_token.get(token_id, 0.0) + usd
+        state[key] = kept
+
+    _collect_from_list("taker_buy_orders")
+    _collect_from_list("shadow_buy_orders")
+
+    pending = state.get("pending_buy_orders")
+    if isinstance(pending, dict):
+        active_order_ids = _collect_order_ids(state.get("open_orders", {}))
+        for order_id, meta in pending.items():
+            if str(order_id) in active_order_ids or not isinstance(meta, dict):
+                continue
+            token_id = str(meta.get("token_id") or "")
+            if not token_id:
+                continue
+            ts = int(meta.get("ts") or 0)
+            if ts <= 0 or (now_ts - ts) > ttl_sec:
+                continue
+            usd = float(meta.get("usd") or 0.0)
+            if usd <= 0:
+                continue
+            total += usd
+            by_token[token_id] = by_token.get(token_id, 0.0) + usd
     return total, by_token
 
 
@@ -2555,12 +2620,114 @@ def _shrink_on_risk_limit(
 
 def _collect_order_ids(open_orders_by_token_id: Dict[str, list[dict]]) -> set[str]:
     order_ids: set[str] = set()
+    if not isinstance(open_orders_by_token_id, dict):
+        return order_ids
     for orders in open_orders_by_token_id.values():
         for order in orders or []:
             order_id = order.get("order_id")
             if order_id:
                 order_ids.add(str(order_id))
     return order_ids
+
+
+def _append_shadow_buy_order(
+    state: Dict[str, Any],
+    *,
+    order_id: str,
+    token_id: str,
+    usd: float,
+    ts: int,
+    reason: str,
+    logger: logging.Logger,
+) -> None:
+    if not token_id or usd <= 0:
+        return
+    shadow_orders = state.setdefault("shadow_buy_orders", [])
+    if not isinstance(shadow_orders, list):
+        state["shadow_buy_orders"] = []
+        shadow_orders = state["shadow_buy_orders"]
+    order_id_s = str(order_id or "")
+    for item in shadow_orders:
+        if not isinstance(item, dict):
+            continue
+        if order_id_s and str(item.get("order_id") or "") == order_id_s:
+            return
+    shadow_orders.append(
+        {
+            "order_id": order_id_s,
+            "token_id": str(token_id),
+            "usd": float(usd),
+            "ts": int(ts),
+            "reason": str(reason),
+        }
+    )
+    logger.info(
+        "[PENDING_BUY_TO_SHADOW] order_id=%s token_id=%s usd=%s reason=%s",
+        order_id_s,
+        token_id,
+        usd,
+        reason,
+    )
+
+
+def _sync_pending_buy_orders_with_open_orders(
+    state: Dict[str, Any],
+    now_ts: int,
+    cfg: Dict[str, Any],
+    logger: logging.Logger,
+) -> None:
+    pending = state.get("pending_buy_orders")
+    if not isinstance(pending, dict) or not pending:
+        return
+    active_order_ids = _collect_order_ids(state.get("open_orders", {}))
+    grace_sec = int(cfg.get("order_visibility_grace_sec") or 180)
+    shadow_ttl_sec = int(cfg.get("shadow_buy_ttl_sec") or 900)
+    ttl_sec = int(cfg.get("pending_buy_ttl_sec") or max(shadow_ttl_sec, grace_sec))
+    changed = False
+    for order_id, meta in list(pending.items()):
+        order_id_s = str(order_id)
+        if order_id_s in active_order_ids:
+            continue
+        if not isinstance(meta, dict):
+            pending.pop(order_id, None)
+            changed = True
+            continue
+        ts = int(meta.get("ts") or 0)
+        age_sec = now_ts - ts if ts > 0 else ttl_sec + 1
+        if ttl_sec > 0 and age_sec > ttl_sec:
+            pending.pop(order_id, None)
+            logger.info(
+                "[PENDING_BUY_CLEAR] order_id=%s token_id=%s usd=%s reason=ttl_expired",
+                order_id_s,
+                meta.get("token_id"),
+                meta.get("usd"),
+            )
+            changed = True
+            continue
+        if age_sec < grace_sec:
+            continue
+        token_id = str(meta.get("token_id") or "")
+        usd = float(meta.get("usd") or 0.0)
+        if shadow_ttl_sec > 0 and token_id and usd > 0:
+            _append_shadow_buy_order(
+                state,
+                order_id=order_id_s,
+                token_id=token_id,
+                usd=usd,
+                ts=ts or now_ts,
+                reason="missing_remote_open_order",
+                logger=logger,
+            )
+        pending.pop(order_id, None)
+        logger.info(
+            "[PENDING_BUY_CLEAR] order_id=%s token_id=%s usd=%s reason=missing_open_order_after_grace",
+            order_id_s,
+            token_id,
+            usd,
+        )
+        changed = True
+    if changed and not pending:
+        state["pending_buy_orders"] = {}
 
 
 def _refresh_managed_order_ids(state: Dict[str, Any]) -> None:
@@ -2694,6 +2861,7 @@ def _merge_remote_open_orders_into_state(
     state["open_orders"] = managed_by_token
     state["managed_order_ids"] = sorted(managed_ids)
     state["remote_order_snapshot_ts"] = int(now_ts)
+    _sync_pending_buy_orders_with_open_orders(state, now_ts, cfg, logger)
 
     if pruned:
         logger.info(
@@ -4267,6 +4435,9 @@ def main() -> None:
     state.setdefault("my_trades_cursor_ms", 0)
     state.setdefault("my_trades_unreliable_until", 0)
     state.setdefault("managed_order_ids", [])
+    state.setdefault("pending_buy_orders", {})
+    state.setdefault("shadow_buy_orders", [])
+    state.setdefault("taker_buy_orders", [])
     state.setdefault("intent_keys", {})
     state.setdefault("token_map", {})
     state.setdefault("bootstrapped", False)
@@ -4315,6 +4486,12 @@ def main() -> None:
         state["open_orders_all"] = {}
     if not isinstance(state.get("managed_order_ids"), list):
         state["managed_order_ids"] = []
+    if not isinstance(state.get("pending_buy_orders"), dict):
+        state["pending_buy_orders"] = {}
+    if not isinstance(state.get("shadow_buy_orders"), list):
+        state["shadow_buy_orders"] = []
+    if not isinstance(state.get("taker_buy_orders"), list):
+        state["taker_buy_orders"] = []
     if not isinstance(state.get("intent_keys"), dict):
         state["intent_keys"] = {}
     if not isinstance(state.get("token_map"), dict):
@@ -6368,7 +6545,8 @@ def main() -> None:
         # CRITICAL: Accumulator is maintained ONLY by local BUY/SELL operations
         # DO NOT reconcile with API data to preserve independence from position API sync issues
         # Accumulator updates happen in ct_exec.py:
-        # - Incremented on successful BUY (both taker and maker)
+        # - Incremented on confirmed taker BUY
+        # - Maker BUY is tracked as pending/open-order exposure until filled or canceled
         # - Decremented on successful SELL
         # - Cleared when SELL reduces it below threshold (0.01)
 
@@ -6422,13 +6600,24 @@ def main() -> None:
                     or 0.0
                 )
                 if my_shares_t <= eps and acc_usd > 0.5 and not orders_t:
-                    logger.warning(
-                        "[CLEANUP_DELAY] token_id=%s reason=accumulator_mismatch acc_usd=%s my_shares=%s",
+                    reconciled_zero = _reconcile_zero_position_accumulator(
+                        state,
                         tid,
-                        acc_usd,
-                        my_shares_t,
+                        my_shares=my_shares_t,
+                        open_orders=orders_t,
+                        now_ts=now_ts,
+                        cfg=cfg,
+                        logger=logger,
+                        eps=eps,
                     )
-                    continue
+                    if not reconciled_zero:
+                        logger.warning(
+                            "[CLEANUP_DELAY] token_id=%s reason=accumulator_mismatch acc_usd=%s my_shares=%s",
+                            tid,
+                            acc_usd,
+                            my_shares_t,
+                        )
+                        continue
 
                 if my_shares_t <= eps and not orders_t:
                     in_quarantine = st_t.get("phase") == "SUSPECT_ZERO"

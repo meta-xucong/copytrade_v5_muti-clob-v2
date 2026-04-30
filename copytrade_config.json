@@ -593,6 +593,8 @@
     "max_notional_total":  500,
     "accumulator_max_total_usd":  500,
     "accumulator_stale_reset_sec":  7200,
+    "accumulator_zero_reconcile_sec":  300,
+    "pending_buy_ttl_sec":  900,
     "sell_accumulator_ttl_sec":  3600,
     "shadow_buy_ttl_sec":  900,
     "boot_sync_mode":  "baseline_only",
