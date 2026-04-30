@@ -14,6 +14,24 @@ $root = Split-Path -Parent $windowsDir
 Set-Location $root
 
 function Get-ActiveClashProfilePath {
+    $vergeRoots = @(
+        (Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev"),
+        (Join-Path $env:APPDATA "io.github.clash-verge.clash-verge"),
+        (Join-Path $env:APPDATA "clash-verge")
+    )
+    foreach ($vergeRoot in $vergeRoots) {
+        $vergeCandidates = @(
+            (Join-Path $vergeRoot "clash-verge.yaml"),
+            (Join-Path $vergeRoot "clash-verge-check.yaml"),
+            (Join-Path $vergeRoot "config.yaml")
+        )
+        foreach ($path in $vergeCandidates) {
+            if ((Test-Path -LiteralPath $path) -and (@(Get-ClashProxyNames -Path $path)).Count -gt 0) {
+                return $path
+            }
+        }
+    }
+
     $profilesDir = Join-Path $env:USERPROFILE ".config\clash\profiles"
     $listPath = Join-Path $profilesDir "list.yml"
     if (-not (Test-Path -LiteralPath $listPath)) {
@@ -44,30 +62,43 @@ function ConvertTo-SafeName {
 }
 
 function Find-ClashCorePath {
-    $processes = @(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -in @("clash-win64.exe", "clash.exe", "mihomo.exe", "mihomo-windows-amd64.exe")
-    })
-    foreach ($proc in $processes) {
-        if ($proc.ExecutablePath -and (Test-Path -LiteralPath $proc.ExecutablePath)) {
-            return $proc.ExecutablePath
-        }
-        if ($proc.CommandLine -match '^\s*"([^"]+\.exe)"') {
-            $candidate = $Matches[1]
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
+    $preferredProcessNames = @(
+        "verge-mihomo.exe",
+        "mihomo.exe",
+        "mihomo-windows-amd64.exe",
+        "clash-win64.exe",
+        "clash.exe"
+    )
+    foreach ($processName in $preferredProcessNames) {
+        $processes = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq $processName })
+        foreach ($proc in $processes) {
+            if ($proc.ExecutablePath -and (Test-Path -LiteralPath $proc.ExecutablePath)) {
+                return $proc.ExecutablePath
             }
-        }
-        if ($proc.CommandLine -match '^\s*([^\s]+\.exe)') {
-            $candidate = $Matches[1]
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
+            if ($proc.CommandLine -match '^\s*"([^"]+\.exe)"') {
+                $candidate = $Matches[1]
+                if (Test-Path -LiteralPath $candidate) {
+                    return $candidate
+                }
+            }
+            if ($proc.CommandLine -match '^\s*([^\s]+\.exe)') {
+                $candidate = $Matches[1]
+                if (Test-Path -LiteralPath $candidate) {
+                    return $candidate
+                }
             }
         }
     }
 
     $common = @(
         "D:\clash\Clash for Windows\resources\static\files\win\x64\clash-win64.exe",
+        "D:\Program Files\Clash Verge\verge-mihomo.exe",
+        "D:\Program Files\Clash Verge Rev\verge-mihomo.exe",
+        "C:\Program Files\Clash Verge\verge-mihomo.exe",
+        "C:\Program Files\Clash Verge Rev\verge-mihomo.exe",
         "$env:LOCALAPPDATA\Programs\Clash for Windows\resources\static\files\win\x64\clash-win64.exe",
+        "$env:LOCALAPPDATA\Programs\Clash Verge\verge-mihomo.exe",
+        "$env:LOCALAPPDATA\Programs\Clash Verge Rev\verge-mihomo.exe",
         "$env:LOCALAPPDATA\Programs\Clash Verge\resources\mihomo.exe",
         "$env:LOCALAPPDATA\Programs\Clash Verge Rev\resources\mihomo.exe"
     )
@@ -107,6 +138,34 @@ function Unquote-Name {
         $value = $value.Substring(1, $value.Length - 2)
     }
     return $value
+}
+
+function Get-ClashProxyNames {
+    param([string]$Path)
+    $lines = Get-Content -LiteralPath $Path -Encoding UTF8
+    $inside = $false
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        if ($line -match '^proxies:\s*$') {
+            $inside = $true
+            continue
+        }
+        if ($inside -and $line -match '^[A-Za-z][A-Za-z -]*:\s*$') {
+            break
+        }
+        if (-not $inside) {
+            continue
+        }
+        if ($line -match '^\s*-\s*\{name:\s*(?<name>[^,}]+)') {
+            $names.Add((Unquote-Name $Matches.name))
+            continue
+        }
+        if ($line -match '^\s*-\s*name:\s*(?<name>.+?)\s*$') {
+            $names.Add((Unquote-Name $Matches.name))
+            continue
+        }
+    }
+    return @($names)
 }
 
 function ConvertTo-YamlSingleQuoted {
@@ -282,7 +341,10 @@ foreach ($listener in @($payload.listeners)) {
     }
 
     $existing = Get-CimInstance Win32_Process |
-        Where-Object { $_.Name -eq "clash-win64.exe" -and $_.CommandLine -like "*$config*" } |
+        Where-Object {
+            $_.Name -in @("clash-win64.exe", "clash.exe", "mihomo.exe", "mihomo-windows-amd64.exe", "verge-mihomo.exe") -and
+            $_.CommandLine -like "*$config*"
+        } |
         Select-Object -First 1
     if ($existing) {
         Write-Host "Already running: $name port=$port pid=$($existing.ProcessId)"

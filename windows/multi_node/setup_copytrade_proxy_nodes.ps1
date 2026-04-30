@@ -37,6 +37,24 @@ $root = Split-Path -Parent $windowsDir
 Set-Location $root
 
 function Get-ActiveClashProfilePath {
+    $vergeRoots = @(
+        (Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev"),
+        (Join-Path $env:APPDATA "io.github.clash-verge.clash-verge"),
+        (Join-Path $env:APPDATA "clash-verge")
+    )
+    foreach ($vergeRoot in $vergeRoots) {
+        $vergeCandidates = @(
+            (Join-Path $vergeRoot "clash-verge.yaml"),
+            (Join-Path $vergeRoot "clash-verge-check.yaml"),
+            (Join-Path $vergeRoot "config.yaml")
+        )
+        foreach ($path in $vergeCandidates) {
+            if ((Test-Path -LiteralPath $path) -and (@(Get-ClashProxyNames -Path $path)).Count -gt 0) {
+                return $path
+            }
+        }
+    }
+
     $candidates = @(
         (Join-Path $env:USERPROFILE ".config\clash\profiles\list.yml")
     )
@@ -92,30 +110,43 @@ function Get-ActiveClashProfilePath {
 }
 
 function Find-ClashCorePath {
-    $processes = @(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -in @("clash-win64.exe", "clash.exe", "mihomo.exe", "mihomo-windows-amd64.exe")
-    })
-    foreach ($proc in $processes) {
-        if ($proc.ExecutablePath -and (Test-Path -LiteralPath $proc.ExecutablePath)) {
-            return $proc.ExecutablePath
-        }
-        if ($proc.CommandLine -match '^\s*"([^"]+\.exe)"') {
-            $candidate = $Matches[1]
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
+    $preferredProcessNames = @(
+        "verge-mihomo.exe",
+        "mihomo.exe",
+        "mihomo-windows-amd64.exe",
+        "clash-win64.exe",
+        "clash.exe"
+    )
+    foreach ($processName in $preferredProcessNames) {
+        $processes = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq $processName })
+        foreach ($proc in $processes) {
+            if ($proc.ExecutablePath -and (Test-Path -LiteralPath $proc.ExecutablePath)) {
+                return $proc.ExecutablePath
             }
-        }
-        if ($proc.CommandLine -match '^\s*([^\s]+\.exe)') {
-            $candidate = $Matches[1]
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
+            if ($proc.CommandLine -match '^\s*"([^"]+\.exe)"') {
+                $candidate = $Matches[1]
+                if (Test-Path -LiteralPath $candidate) {
+                    return $candidate
+                }
+            }
+            if ($proc.CommandLine -match '^\s*([^\s]+\.exe)') {
+                $candidate = $Matches[1]
+                if (Test-Path -LiteralPath $candidate) {
+                    return $candidate
+                }
             }
         }
     }
 
     $common = @(
         "D:\clash\Clash for Windows\resources\static\files\win\x64\clash-win64.exe",
+        "D:\Program Files\Clash Verge\verge-mihomo.exe",
+        "D:\Program Files\Clash Verge Rev\verge-mihomo.exe",
+        "C:\Program Files\Clash Verge\verge-mihomo.exe",
+        "C:\Program Files\Clash Verge Rev\verge-mihomo.exe",
         "$env:LOCALAPPDATA\Programs\Clash for Windows\resources\static\files\win\x64\clash-win64.exe",
+        "$env:LOCALAPPDATA\Programs\Clash Verge\verge-mihomo.exe",
+        "$env:LOCALAPPDATA\Programs\Clash Verge Rev\verge-mihomo.exe",
         "$env:LOCALAPPDATA\Programs\Clash Verge\resources\mihomo.exe",
         "$env:LOCALAPPDATA\Programs\Clash Verge Rev\resources\mihomo.exe"
     )

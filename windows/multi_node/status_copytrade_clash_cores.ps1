@@ -35,7 +35,8 @@ if (-not (Test-Path -LiteralPath $Mapping)) {
 
 $payload = Get-Content -LiteralPath $Mapping -Raw -Encoding UTF8 | ConvertFrom-Json
 $managed = @(Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -eq "clash-win64.exe" -and $_.CommandLine -like "*logs\clash_copytrade\cores*"
+    $_.Name -in @("clash-win64.exe", "clash.exe", "mihomo.exe", "mihomo-windows-amd64.exe", "verge-mihomo.exe") -and
+    $_.CommandLine -like "*logs\clash_copytrade\cores*"
 })
 
 foreach ($listener in @($payload.listeners)) {
