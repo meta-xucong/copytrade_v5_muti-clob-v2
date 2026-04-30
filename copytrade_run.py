@@ -65,6 +65,7 @@ from ct_exec import (
 )
 from ct_resolver import (
     gamma_fetch_markets_by_clob_token_ids,
+    gamma_fetch_topic_metadata_by_token_ids,
     market_tradeable_state,
     resolve_token_id,
 )
@@ -891,6 +892,7 @@ def _fetch_all_target_actions(
     taker_only: bool,
     logger: logging.Logger,
     target_blacklists: Dict[str, List[str]] | None = None,
+    target_whitelists: Dict[str, List[str]] | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch actions/trades from all target addresses and merge them.
@@ -938,15 +940,42 @@ def _fetch_all_target_actions(
             if target_latest_ms > max_latest_ms:
                 max_latest_ms = target_latest_ms
 
+            whitelist_enabled = target_whitelists is not None and target_addr.lower() in target_whitelists
+            whitelist = _normalize_whitelist((target_whitelists or {}).get(target_addr.lower()))
+            topic_meta_by_token: Dict[str, Dict[str, Any]] = {}
+            if whitelist_enabled:
+                buy_token_ids: List[str] = []
+                condition_ids_by_token: Dict[str, str] = {}
+                for action in actions:
+                    if str(action.get("side") or "").upper() != "BUY":
+                        continue
+                    token_id = str(action.get("token_id") or "").strip()
+                    condition_id = str(action.get("condition_id") or "").strip()
+                    if not token_id:
+                        continue
+                    buy_token_ids.append(token_id)
+                    if condition_id:
+                        condition_ids_by_token[token_id] = condition_id
+                if buy_token_ids:
+                    topic_meta_by_token = gamma_fetch_topic_metadata_by_token_ids(
+                        buy_token_ids,
+                        condition_ids_by_token=condition_ids_by_token,
+                    )
+
             # Add source target to each action (with per-target blacklist filter on BUY only)
             blacklist = _normalize_token_blacklist(
                 (target_blacklists or {}).get(target_addr.lower(), [])
             )
             skipped_blacklist = 0
+            skipped_whitelist = 0
             for action in actions:
                 action_copy = dict(action)
                 action_copy["_source_target"] = target_addr
                 side = str(action_copy.get("side") or "").upper()
+                token_id = str(action_copy.get("token_id") or "").strip()
+                topic_meta = topic_meta_by_token.get(token_id) if token_id else None
+                if topic_meta:
+                    _attach_topic_metadata(action_copy, topic_meta)
                 if blacklist and side == "BUY":
                     title_l = str(
                         action_copy.get("title")
@@ -956,11 +985,20 @@ def _fetch_all_target_actions(
                     if any(str(bl_item).lower() in title_l for bl_item in blacklist if bl_item is not None):
                         skipped_blacklist += 1
                         continue
+                if whitelist_enabled and side == "BUY" and not _topic_matches_whitelist(whitelist, topic_meta):
+                    skipped_whitelist += 1
+                    continue
                 all_actions.append(action_copy)
             if skipped_blacklist:
                 logger.debug(
                     "[MULTI-TARGET] Skipped %d blacklisted BUY actions from target=%s",
                     skipped_blacklist,
+                    _shorten_address(target_addr),
+                )
+            if skipped_whitelist:
+                logger.debug(
+                    "[MULTI-TARGET] Skipped %d non-whitelisted BUY actions from target=%s",
+                    skipped_whitelist,
                     _shorten_address(target_addr),
                 )
 
@@ -1017,6 +1055,44 @@ def _normalize_token_blacklist(value: Any) -> List[str]:
         return out
     text = str(value).strip()
     return [text] if text else []
+
+
+def _normalize_topic_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+
+
+def _normalize_whitelist(values: List[str] | None) -> Set[str]:
+    normalized = {
+        _normalize_topic_key(value)
+        for value in (values or [])
+        if _normalize_topic_key(value)
+    }
+    return normalized
+
+
+def _attach_topic_metadata(action: Dict[str, Any], topic_meta: Dict[str, Any]) -> None:
+    topic_keys = topic_meta.get("topic_keys") or []
+    if isinstance(topic_keys, list):
+        action["topic_keys"] = list(topic_keys)
+    action["_topic_meta"] = dict(topic_meta)
+
+
+def _topic_matches_whitelist(whitelist: Set[str], topic_meta: Dict[str, Any] | None) -> bool:
+    if not whitelist:
+        return False
+    if not isinstance(topic_meta, dict):
+        return False
+    topic_keys = topic_meta.get("topic_keys") or []
+    normalized_keys = {
+        normalized
+        for value in topic_keys
+        for normalized in [_normalize_topic_key(value)]
+        if normalized
+    }
+    return bool(normalized_keys & whitelist)
 
 
 def _cfg_bool(value: Any, default: bool = False) -> bool:
@@ -4207,6 +4283,9 @@ def main() -> None:
     target_addresses: List[str] = []
     target_ratios: Dict[str, float] = {}
     target_blacklists: Dict[str, List[str]] = {}
+    target_whitelists: Dict[str, List[str]] = {}
+    whitelist_missing = object()
+    global_whitelist = cfg.get("whitelist_topic_keys", whitelist_missing)
     target_list = cfg.get("target_addresses")
     if isinstance(target_list, list) and target_list:
         for item in target_list:
@@ -4218,6 +4297,8 @@ def main() -> None:
                     target_blacklists[addr_str.lower()] = _normalize_token_blacklist(
                         cfg.get("blacklist_token_keys")
                     )
+                    if isinstance(global_whitelist, list):
+                        target_whitelists[addr_str.lower()] = global_whitelist
                 else:
                     pass  # silently skip invalid address before logger init
             elif isinstance(item, dict):
@@ -4234,6 +4315,13 @@ def main() -> None:
                         target_blacklists[addr_str.lower()] = _normalize_token_blacklist(
                             cfg.get("blacklist_token_keys")
                         )
+                    if "whitelist_topic_keys" in item:
+                        per_target_wl = item.get("whitelist_topic_keys")
+                        target_whitelists[addr_str.lower()] = (
+                            per_target_wl if isinstance(per_target_wl, list) else []
+                        )
+                    elif isinstance(global_whitelist, list):
+                        target_whitelists[addr_str.lower()] = global_whitelist
                 else:
                     pass  # silently skip invalid address before logger init
             else:
@@ -4256,6 +4344,8 @@ def main() -> None:
             target_blacklists[
                 str(single_target).strip().lower()
             ] = _normalize_token_blacklist(cfg.get("blacklist_token_keys"))
+            if isinstance(global_whitelist, list):
+                target_whitelists[str(single_target).strip().lower()] = global_whitelist
 
     if not target_addresses:
         raise ValueError(
@@ -4902,6 +4992,12 @@ def main() -> None:
                     for k, v in target_blacklists.items()
                 )
             ),
+            tuple(
+                sorted(
+                    (k, tuple(sorted(v)))
+                    for k, v in target_whitelists.items()
+                )
+            ),
             positions_limit,
             positions_max_pages,
             round(size_threshold, 9),
@@ -4956,6 +5052,7 @@ def main() -> None:
                     taker_only=bool(cfg.get("actions_taker_only", False)),
                     logger=logger,
                     target_blacklists=target_blacklists,
+                    target_whitelists=target_whitelists,
                 )
             except Exception as exc:
                 logger.warning("[SHARED_CACHE] fetch target actions failed: %s", exc)

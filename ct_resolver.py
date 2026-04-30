@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -13,6 +14,150 @@ _last_gamma_request_ts = 0.0
 _sampling_market_index: dict[str, dict] = {}
 _sampling_market_index_ts = 0.0
 _SAMPLING_INDEX_TTL_SEC = 300.0
+_TOPIC_META_TTL_SEC = 300.0
+_topic_meta_by_token: dict[str, dict[str, Any]] = {}
+_topic_meta_by_condition: dict[str, dict[str, Any]] = {}
+_topic_tags_by_market_id: dict[str, dict[str, Any]] = {}
+
+_SECTOR_KEYWORDS = {
+    "sports": {
+        "baseball",
+        "basketball",
+        "champions league",
+        "football",
+        "golf",
+        "hockey",
+        "league cup",
+        "match winner",
+        "mlb",
+        "mma",
+        "moneyline",
+        "nba",
+        "nfl",
+        "nhl",
+        "premier league",
+        "soccer",
+        "spread",
+        "spreads",
+        "sports",
+        "tennis",
+        "ufc",
+        "world cup",
+    },
+    "esports": {
+        "counter strike",
+        "cs2",
+        "dota",
+        "esport",
+        "esports",
+        "league of legends",
+        "lol",
+        "valorant",
+    },
+    "us-politics": {
+        "approval",
+        "biden",
+        "congress",
+        "democrat",
+        "election",
+        "governor",
+        "gop",
+        "house",
+        "politics",
+        "president",
+        "presidential",
+        "republican",
+        "senate",
+        "supreme court",
+        "trump",
+        "us election",
+        "white house",
+    },
+    "geopolitics": {
+        "ceasefire",
+        "china",
+        "foreign policy",
+        "gaza",
+        "geopolitics",
+        "iran",
+        "israel",
+        "military",
+        "nato",
+        "russia",
+        "taiwan",
+        "ukraine",
+        "war",
+    },
+    "crypto": {
+        "airdrop",
+        "bitcoin",
+        "blockchain",
+        "btc",
+        "crypto",
+        "defi",
+        "dogecoin",
+        "ethereum",
+        "eth",
+        "nft",
+        "solana",
+        "stablecoin",
+        "token",
+    },
+    "macro": {
+        "bond",
+        "bonds",
+        "cpi",
+        "crude",
+        "economy",
+        "economic",
+        "fed",
+        "fomc",
+        "gdp",
+        "gold",
+        "inflation",
+        "interest rate",
+        "macro",
+        "nasdaq",
+        "oil",
+        "ppi",
+        "rates",
+        "s&p",
+        "sp500",
+        "stock market",
+        "stocks",
+        "treasury",
+        "unemployment",
+    },
+    "entertainment": {
+        "box office",
+        "celebrity",
+        "emmys",
+        "entertainment",
+        "film",
+        "grammys",
+        "movie",
+        "music",
+        "oscars",
+        "reality tv",
+        "television",
+        "tv",
+    },
+}
+
+_SECTOR_TOPIC_ALIASES = {
+    "crypto-markets": "crypto",
+    "e-sports": "esports",
+    "esport": "esports",
+    "finance": "macro",
+    "markets": "macro",
+    "politics": "us-politics",
+    "sport": "sports",
+    "sports-betting": "sports",
+    "us-politics": "us-politics",
+    "us-politics-election": "us-politics",
+    "us-political": "us-politics",
+    "us-politics-approval": "us-politics",
+}
 
 
 def _enforce_gamma_rate_limit() -> None:
@@ -108,6 +253,25 @@ def _extract_token_ids_from_market(market: Dict[str, Any]) -> list[str]:
     return []
 
 
+def _normalize_topic_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return _SECTOR_TOPIC_ALIASES.get(text, text)
+
+
+def _tokenize_topic_text(value: Any) -> set[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return set()
+    normalized = re.sub(r"[^a-z0-9]+", " ", text)
+    parts = {part for part in normalized.split() if part}
+    if normalized:
+        parts.add(normalized.strip())
+    return parts
+
+
 def _norm_market_flag(market: Dict[str, Any], camel_key: str, snake_key: str) -> Any:
     if camel_key in market and market.get(camel_key) is not None:
         return market.get(camel_key)
@@ -194,6 +358,237 @@ def _gamma_fetch_by_condition(condition_id: str) -> Optional[dict]:
     if isinstance(markets, list) and markets:
         return markets[0]
     return None
+
+
+def _gamma_fetch_market_tags(market_id: str) -> list[dict[str, Any]]:
+    market_key = str(market_id or "").strip()
+    if not market_key:
+        return []
+    now = time.monotonic()
+    cached = _topic_tags_by_market_id.get(market_key)
+    if cached and now - float(cached.get("fetched_at") or 0.0) < _TOPIC_META_TTL_SEC:
+        return list(cached.get("tags") or [])
+
+    payload = _http_json(f"{GAMMA_ROOT}/markets/{market_key}/tags")
+    tags: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        tags = [item for item in payload if isinstance(item, dict)]
+    elif isinstance(payload, dict):
+        raw_tags = payload.get("tags") or payload.get("data") or []
+        if isinstance(raw_tags, list):
+            tags = [item for item in raw_tags if isinstance(item, dict)]
+
+    _topic_tags_by_market_id[market_key] = {
+        "fetched_at": now,
+        "tags": tags,
+    }
+    return list(tags)
+
+
+def _derive_sector_topics(
+    question: Any,
+    topic_keys: set[str],
+    category: Any,
+    subcategory: Any,
+    series_slug: Any,
+    sports_market_type: Any,
+) -> set[str]:
+    derived: set[str] = set()
+    text_parts = [
+        str(question or ""),
+        str(category or ""),
+        str(subcategory or ""),
+        str(series_slug or ""),
+        str(sports_market_type or ""),
+        " ".join(sorted(topic_keys)),
+    ]
+    text_blob = " ".join(part for part in text_parts if part).lower()
+    normalized_blob = re.sub(r"[^a-z0-9]+", " ", text_blob)
+    normalized_keys = {_normalize_topic_key(value) for value in topic_keys if value}
+
+    for sector, keywords in _SECTOR_KEYWORDS.items():
+        if sector in normalized_keys:
+            derived.add(sector)
+            continue
+        for keyword in keywords:
+            if f" {keyword} " in f" {normalized_blob} ":
+                derived.add(sector)
+                break
+
+    if "us-politics" in derived or "geopolitics" in derived:
+        derived.add("politics")
+    if any(key.startswith("politic") for key in normalized_keys):
+        derived.add("politics")
+    if "sports" in derived and "esports" in derived:
+        derived.add("gaming")
+
+    return derived
+
+
+def _market_topic_metadata_from_market(market: Dict[str, Any]) -> dict[str, Any]:
+    market_id = str(market.get("id") or market.get("market_id") or "").strip()
+    condition_id = str(market.get("conditionId") or market.get("condition_id") or "").strip()
+    question = str(
+        market.get("question")
+        or market.get("title")
+        or market.get("description")
+        or market.get("eventTitle")
+        or ""
+    ).strip()
+    category = market.get("category")
+    subcategory = market.get("subcategory")
+    series_slug = market.get("seriesSlug") or market.get("series_slug")
+    sports_market_type = market.get("sportsMarketType") or market.get("sports_market_type")
+
+    topic_keys: set[str] = set()
+    for value in (category, subcategory, series_slug, sports_market_type):
+        normalized = _normalize_topic_key(value)
+        if normalized:
+            topic_keys.add(normalized)
+
+    events = market.get("events") or []
+    if isinstance(events, dict):
+        events = [events]
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            for value in (
+                event.get("category"),
+                event.get("subcategory"),
+                event.get("seriesSlug"),
+                event.get("series_slug"),
+            ):
+                normalized = _normalize_topic_key(value)
+                if normalized:
+                    topic_keys.add(normalized)
+
+    tag_items = market.get("tags") or []
+    if isinstance(tag_items, dict):
+        tag_items = tag_items.get("tags") or tag_items.get("data") or []
+    if not isinstance(tag_items, list):
+        tag_items = []
+    if not tag_items and market_id:
+        tag_items = _gamma_fetch_market_tags(market_id)
+
+    for tag in tag_items:
+        if isinstance(tag, dict):
+            values = (
+                tag.get("slug"),
+                tag.get("label"),
+                tag.get("name"),
+                tag.get("tag"),
+            )
+        else:
+            values = (tag,)
+        for value in values:
+            normalized = _normalize_topic_key(value)
+            if normalized:
+                topic_keys.add(normalized)
+
+    topic_keys.update(
+        _derive_sector_topics(
+            question=question,
+            topic_keys=topic_keys,
+            category=category,
+            subcategory=subcategory,
+            series_slug=series_slug,
+            sports_market_type=sports_market_type,
+        )
+    )
+
+    return {
+        "market_id": market_id or None,
+        "condition_id": condition_id or None,
+        "question": question or None,
+        "category": str(category).strip() if category is not None else None,
+        "subcategory": str(subcategory).strip() if subcategory is not None else None,
+        "series_slug": str(series_slug).strip() if series_slug is not None else None,
+        "sports_market_type": (
+            str(sports_market_type).strip() if sports_market_type is not None else None
+        ),
+        "topic_keys": sorted(topic_keys),
+    }
+
+
+def gamma_fetch_topic_metadata_by_token_ids(
+    token_ids: list[str],
+    condition_ids_by_token: Optional[dict[str, str]] = None,
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not token_ids:
+        return out
+
+    now = time.monotonic()
+    normalized_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for token_id in token_ids:
+        token_text = str(token_id or "").strip()
+        if not token_text or token_text in seen_ids:
+            continue
+        seen_ids.add(token_text)
+        normalized_ids.append(token_text)
+
+    unresolved: list[str] = []
+    for token_id in normalized_ids:
+        cached = _topic_meta_by_token.get(token_id)
+        if cached and now - float(cached.get("fetched_at") or 0.0) < _TOPIC_META_TTL_SEC:
+            out[token_id] = dict(cached.get("data") or {})
+            continue
+        condition_id = str((condition_ids_by_token or {}).get(token_id) or "").strip()
+        if condition_id:
+            condition_cached = _topic_meta_by_condition.get(condition_id)
+            if condition_cached and now - float(condition_cached.get("fetched_at") or 0.0) < _TOPIC_META_TTL_SEC:
+                data = dict(condition_cached.get("data") or {})
+                out[token_id] = data
+                _topic_meta_by_token[token_id] = {"fetched_at": now, "data": data}
+                continue
+        unresolved.append(token_id)
+
+    if unresolved:
+        markets_by_token = gamma_fetch_markets_by_clob_token_ids(unresolved)
+        for token_id in list(unresolved):
+            market = markets_by_token.get(token_id)
+            if not isinstance(market, dict):
+                continue
+            meta = _market_topic_metadata_from_market(market)
+            token_ids_in_market = _extract_token_ids_from_market(market) or [token_id]
+            condition_id = str(meta.get("condition_id") or "").strip()
+            for market_token_id in token_ids_in_market:
+                market_token_text = str(market_token_id or "").strip()
+                if not market_token_text:
+                    continue
+                _topic_meta_by_token[market_token_text] = {
+                    "fetched_at": now,
+                    "data": meta,
+                }
+                if market_token_text in unresolved:
+                    out[market_token_text] = dict(meta)
+            if condition_id:
+                _topic_meta_by_condition[condition_id] = {
+                    "fetched_at": now,
+                    "data": meta,
+                }
+
+    remaining = [token_id for token_id in normalized_ids if token_id not in out]
+    for token_id in remaining:
+        condition_id = str((condition_ids_by_token or {}).get(token_id) or "").strip()
+        if not condition_id:
+            continue
+        market = _gamma_fetch_by_condition(condition_id)
+        if not isinstance(market, dict):
+            continue
+        meta = _market_topic_metadata_from_market(market)
+        out[token_id] = dict(meta)
+        _topic_meta_by_token[token_id] = {"fetched_at": now, "data": meta}
+        meta_condition_id = str(meta.get("condition_id") or condition_id).strip()
+        if meta_condition_id:
+            _topic_meta_by_condition[meta_condition_id] = {
+                "fetched_at": now,
+                "data": meta,
+            }
+
+    return out
 
 
 def gamma_fetch_markets_by_clob_token_ids(token_ids: list[str]) -> dict[str, dict]:
