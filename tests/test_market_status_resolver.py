@@ -140,3 +140,96 @@ def test_market_tradeable_state_supports_snake_case_fields():
         "active": True,
     }
     assert ct_resolver.market_tradeable_state(market) is True
+
+
+def test_gamma_fetch_topic_metadata_by_token_ids_normalizes_topic_keys(monkeypatch):
+    token_id = "topic_tid_1"
+    market = {
+        "id": "market_1",
+        "conditionId": "cond_1",
+        "question": "Who wins the US election?",
+        "category": "Politics",
+        "seriesSlug": "US Politics",
+        "clobTokenIds": json.dumps([token_id]),
+        "tags": [{"slug": "us_politics"}],
+    }
+
+    monkeypatch.setattr(
+        ct_resolver,
+        "gamma_fetch_markets_by_clob_token_ids",
+        lambda token_ids: {token_id: market},
+    )
+
+    got = ct_resolver.gamma_fetch_topic_metadata_by_token_ids([token_id])
+    assert "us-politics" in got[token_id]["topic_keys"]
+    assert "politics" in got[token_id]["topic_keys"]
+
+
+def test_gamma_fetch_topic_metadata_by_token_ids_falls_back_to_condition(monkeypatch):
+    token_id = "topic_tid_2"
+    condition_id = "cond_fallback"
+    market = {
+        "id": "market_2",
+        "conditionId": condition_id,
+        "question": "Will CPI rise this month?",
+        "category": "Finance",
+        "tags": [{"slug": "cpi"}],
+    }
+
+    monkeypatch.setattr(ct_resolver, "gamma_fetch_markets_by_clob_token_ids", lambda token_ids: {})
+    monkeypatch.setattr(ct_resolver, "_gamma_fetch_by_condition", lambda cond: market if cond == condition_id else None)
+
+    got = ct_resolver.gamma_fetch_topic_metadata_by_token_ids(
+        [token_id],
+        condition_ids_by_token={token_id: condition_id},
+    )
+    assert "macro" in got[token_id]["topic_keys"]
+
+
+def test_market_topic_metadata_fetches_tags_when_market_payload_is_sparse(monkeypatch):
+    monkeypatch.setattr(
+        ct_resolver,
+        "_gamma_fetch_market_tags",
+        lambda market_id: [{"slug": "esports"}, {"label": "Counter Strike"}],
+    )
+    market = {
+        "id": "market_sparse",
+        "conditionId": "cond_sparse",
+        "question": "Will Team A win the grand final?",
+        "clobTokenIds": json.dumps(["tok_sparse"]),
+    }
+
+    got = ct_resolver._market_topic_metadata_from_market(market)
+    assert "esports" in got["topic_keys"]
+    assert "counter-strike" in got["topic_keys"]
+
+
+def test_market_topic_metadata_derives_sector_topics_from_tags_and_title(monkeypatch):
+    monkeypatch.setattr(ct_resolver, "_gamma_fetch_market_tags", lambda _market_id: [])
+    market = {
+        "id": "market_geo",
+        "conditionId": "cond_geo",
+        "question": "Will Israel and Iran reach a ceasefire?",
+        "category": "World",
+        "tags": [{"slug": "middle-east"}],
+        "clobTokenIds": json.dumps(["tok_geo"]),
+    }
+
+    got = ct_resolver._market_topic_metadata_from_market(market)
+    assert "geopolitics" in got["topic_keys"]
+    assert "politics" in got["topic_keys"]
+
+
+def test_market_topic_metadata_derives_macro_from_finance_tags(monkeypatch):
+    monkeypatch.setattr(ct_resolver, "_gamma_fetch_market_tags", lambda _market_id: [])
+    market = {
+        "id": "market_macro",
+        "conditionId": "cond_macro",
+        "question": "Will the Fed cut rates?",
+        "category": "Finance",
+        "tags": [{"slug": "fed"}, {"slug": "interest-rates"}],
+        "clobTokenIds": json.dumps(["tok_macro"]),
+    }
+
+    got = ct_resolver._market_topic_metadata_from_market(market)
+    assert "macro" in got["topic_keys"]
