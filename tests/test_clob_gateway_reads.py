@@ -33,6 +33,31 @@ def test_get_or_create_api_creds_v2_prefers_derive_before_create():
     assert creds.api_key == "derived-key"
 
 
+def test_get_or_create_api_creds_v2_retries_derive_after_create_race(monkeypatch):
+    called = []
+
+    class Creds:
+        api_key = "derived-after-race"
+
+    def derive():
+        called.append("derive")
+        if called.count("derive") == 1:
+            raise RuntimeError("temporary derive timeout")
+        return Creds()
+
+    def create():
+        called.append("create")
+        raise RuntimeError("Could not create api key")
+
+    monkeypatch.setattr(ct_clob_gateway.time, "sleep", lambda *_args, **_kwargs: None)
+    client = SimpleNamespace(derive_api_key=derive, create_api_key=create)
+
+    creds = ct_clob_gateway._get_or_create_api_creds_v2(client)
+
+    assert creds.api_key == "derived-after-race"
+    assert called == ["derive", "create", "derive"]
+
+
 def test_get_orderbook_v2_uses_real_book_before_price_endpoints():
     client = SimpleNamespace(
         get_order_books=lambda payload: [

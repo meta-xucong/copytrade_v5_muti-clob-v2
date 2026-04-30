@@ -51,11 +51,29 @@ function Get-ActiveClashProfilePath {
         if ($indexMatch.Success) {
             $index = [int]$indexMatch.Groups[1].Value
         }
-        $matches = [regex]::Matches($raw, "(?m)^\s*-\s*time:\s*(.+?)\s*$")
-        if ($matches.Count -gt $index) {
-            $fileName = $matches[$index].Groups[1].Value.Trim().Trim('"').Trim("'")
+        # Clash profile lists have used both "- time: xxx.yml" and nested
+        # "time: xxx.yml" shapes.  Accept both, then prefer the active index
+        # only if that profile actually contains proxy nodes.
+        $matches = [regex]::Matches($raw, "(?m)^\s*(?:-\s*)?time:\s*(.+?)\s*$")
+        $profilePaths = New-Object System.Collections.Generic.List[string]
+        foreach ($match in $matches) {
+            $fileName = $match.Groups[1].Value.Trim().Trim('"').Trim("'")
+            if (-not $fileName) {
+                continue
+            }
             $path = Join-Path $profilesDir $fileName
-            if (Test-Path -LiteralPath $path) {
+            if ((Test-Path -LiteralPath $path) -and -not $profilePaths.Contains($path)) {
+                $profilePaths.Add($path)
+            }
+        }
+        if ($profilePaths.Count -gt $index) {
+            $path = $profilePaths[$index]
+            if ((@(Get-ClashProxyNames -Path $path)).Count -gt 0) {
+                return $path
+            }
+        }
+        foreach ($path in @($profilePaths | Sort-Object { (Get-Item -LiteralPath $_).LastWriteTime } -Descending)) {
+            if ((@(Get-ClashProxyNames -Path $path)).Count -gt 0) {
                 return $path
             }
         }
@@ -66,7 +84,7 @@ function Get-ActiveClashProfilePath {
         (Join-Path $env:USERPROFILE ".config\mihomo\config.yaml")
     )
     foreach ($path in $fallbacks) {
-        if (Test-Path -LiteralPath $path) {
+        if ((Test-Path -LiteralPath $path) -and (@(Get-ClashProxyNames -Path $path)).Count -gt 0) {
             return $path
         }
     }

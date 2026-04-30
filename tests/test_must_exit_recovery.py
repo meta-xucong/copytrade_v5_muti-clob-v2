@@ -7,11 +7,15 @@ sys.path.insert(0, ".")
 import copytrade_run
 from copytrade_run import (
     _finalize_exited_token_state,
+    _get_post_exit_reentry_guard,
     _is_must_exit_fresh,
     _estimate_recovery_shares_from_state,
     _mark_must_exit_token,
+    _mark_post_exit_reentry_guard,
+    _prune_post_exit_reentry_guard,
     _should_clear_stale_must_exit_on_buy,
     _should_clear_must_exit_without_inventory,
+    _should_hold_post_exit_reentry_buy,
 )
 
 
@@ -143,6 +147,85 @@ def test_exit_finalization_clears_tail_state_and_blocks_re_mark():
     assert int(state.get("exit_finalization", {}).get("t1", {}).get("until") or 0) == 1180, state
     _mark_must_exit_token(state, "t1", 1050, "target_sell_action", target_sell_ms=12345)
     assert "t1" not in state.get("must_exit_tokens", {}), state
+    guard = _get_post_exit_reentry_guard(state, "t1", 1050)
+    assert isinstance(guard, dict), state
+
+
+def test_post_exit_reentry_guard_blocks_residual_position_buy():
+    state = {}
+    cfg = {
+        "post_exit_reentry_guard_sec": 1800,
+        "post_exit_reentry_requires_fresh_buy": True,
+        "post_exit_reentry_min_delay_sec": 0,
+    }
+    _mark_post_exit_reentry_guard(
+        state,
+        "t1",
+        1000,
+        cfg,
+        target_sell_ms=1000000,
+        source="target_sell",
+    )
+    hold, reason, remain = _should_hold_post_exit_reentry_buy(
+        state=state,
+        token_id="t1",
+        now_ts=1100,
+        cfg=cfg,
+        has_buy=False,
+        buy_signal_ms=0,
+        buy_sum=0.0,
+        min_target_buy_shares=1.0,
+    )
+    assert hold is True and reason == "post_exit_guard_no_fresh_buy", (hold, reason, remain)
+    assert remain == 1700, remain
+
+
+def test_post_exit_reentry_guard_allows_fresh_buy_after_sell():
+    state = {}
+    cfg = {
+        "post_exit_reentry_guard_sec": 1800,
+        "post_exit_reentry_requires_fresh_buy": True,
+        "post_exit_reentry_min_delay_sec": 30,
+    }
+    _mark_post_exit_reentry_guard(
+        state,
+        "t1",
+        1000,
+        cfg,
+        target_sell_ms=1000000,
+        source="target_sell",
+    )
+    hold, reason, _ = _should_hold_post_exit_reentry_buy(
+        state=state,
+        token_id="t1",
+        now_ts=1010,
+        cfg=cfg,
+        has_buy=True,
+        buy_signal_ms=1005000,
+        buy_sum=5.0,
+        min_target_buy_shares=1.0,
+    )
+    assert hold is True and reason == "post_exit_guard_min_delay", (hold, reason)
+    hold, reason, _ = _should_hold_post_exit_reentry_buy(
+        state=state,
+        token_id="t1",
+        now_ts=1040,
+        cfg=cfg,
+        has_buy=True,
+        buy_signal_ms=1005000,
+        buy_sum=5.0,
+        min_target_buy_shares=1.0,
+    )
+    assert hold is False and reason == "fresh_buy_after_exit", (hold, reason)
+
+
+def test_post_exit_reentry_guard_prunes_after_expiry():
+    state = {}
+    cfg = {"post_exit_reentry_guard_sec": 60}
+    _mark_post_exit_reentry_guard(state, "t1", 1000, cfg, target_sell_ms=1000000)
+    assert _get_post_exit_reentry_guard(state, "t1", 1059)
+    _prune_post_exit_reentry_guard(state, 1060)
+    assert _get_post_exit_reentry_guard(state, "t1", 1060) is None
 
 
 def test_hemostasis_sell_actions_are_marked_as_exit_flow(monkeypatch):
@@ -212,4 +295,7 @@ if __name__ == "__main__":
     test_estimate_recovery_shares_prefers_max_source()
     test_should_clear_must_exit_guarded_by_recent_cache()
     test_exit_finalization_clears_tail_state_and_blocks_re_mark()
+    test_post_exit_reentry_guard_blocks_residual_position_buy()
+    test_post_exit_reentry_guard_allows_fresh_buy_after_sell()
+    test_post_exit_reentry_guard_prunes_after_expiry()
     print("ALL MUST_EXIT TESTS PASSED")

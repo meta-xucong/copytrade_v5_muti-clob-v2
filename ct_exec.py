@@ -47,6 +47,9 @@ class _SimpleRateLimiter:
 
 _DEFAULT_CLOB_MAX_RPS = float(os.getenv("CT_CLOB_MAX_RPS", "8"))
 _CLOB_LIMITER = _SimpleRateLimiter(_DEFAULT_CLOB_MAX_RPS)
+_ORDERBOOK_PROVIDER: Any = None
+_ORDERBOOK_PROVIDER_PREFER = False
+_ORDERBOOK_PROVIDER_MAX_AGE_SEC = 5.0
 
 
 def configure_clob_rate_limit(rps: float) -> None:
@@ -55,6 +58,26 @@ def configure_clob_rate_limit(rps: float) -> None:
         _CLOB_LIMITER.set_rps(float(rps))
     except Exception:
         pass
+
+
+def configure_orderbook_provider(
+    provider: Any,
+    *,
+    prefer: bool = True,
+    max_age_sec: float = 5.0,
+) -> None:
+    """Configure an optional read-through orderbook provider.
+
+    The provider is intentionally best-effort: if it has no fresh book or raises,
+    get_orderbook falls back to the existing CLOB REST path.
+    """
+    global _ORDERBOOK_PROVIDER, _ORDERBOOK_PROVIDER_PREFER, _ORDERBOOK_PROVIDER_MAX_AGE_SEC
+    _ORDERBOOK_PROVIDER = provider
+    _ORDERBOOK_PROVIDER_PREFER = bool(provider is not None and prefer)
+    try:
+        _ORDERBOOK_PROVIDER_MAX_AGE_SEC = max(0.1, float(max_age_sec))
+    except Exception:
+        _ORDERBOOK_PROVIDER_MAX_AGE_SEC = 5.0
 
 
 def _mid_price(orderbook: Dict[str, Optional[float]]) -> Optional[float]:
@@ -346,6 +369,32 @@ def _post_order_with_retry(
 def get_orderbook(
     client: Any, token_id: str, timeout: Optional[float] = None
 ) -> Dict[str, Optional[float]]:
+    if _ORDERBOOK_PROVIDER_PREFER and _ORDERBOOK_PROVIDER is not None:
+        try:
+            provider_book = _ORDERBOOK_PROVIDER.get_orderbook(
+                token_id,
+                max_age_sec=_ORDERBOOK_PROVIDER_MAX_AGE_SEC,
+            )
+        except TypeError:
+            try:
+                provider_book = _ORDERBOOK_PROVIDER.get_orderbook(token_id)
+            except Exception:
+                provider_book = None
+        except Exception:
+            provider_book = None
+        if isinstance(provider_book, Mapping):
+            best_bid = safe_float(provider_book.get("best_bid"))
+            best_ask = safe_float(provider_book.get("best_ask"))
+            if best_bid is not None and best_bid <= 0:
+                best_bid = None
+            if best_ask is not None and best_ask <= 0:
+                best_ask = None
+            if best_bid is not None and best_ask is not None and best_bid > best_ask:
+                best_bid = None
+                best_ask = None
+            if best_bid is not None or best_ask is not None:
+                return {"best_bid": best_bid, "best_ask": best_ask}
+
     if is_v2_client(client):
         return get_orderbook_v2(client, token_id, timeout)
     tid = str(token_id)

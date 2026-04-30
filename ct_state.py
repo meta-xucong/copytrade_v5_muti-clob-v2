@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from ct_runtime_health import RUNTIME_HEALTH_DEFAULT, ensure_runtime_health
+
 
 DEFAULT_STATE: Dict[str, Any] = {
     "token_map": {},
@@ -44,6 +46,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "remote_order_snapshot_ts": 0,
     "collateral_preflight": {},
     "conditional_preflight_by_token": {},
+    "runtime_health": RUNTIME_HEALTH_DEFAULT,
 }
 
 
@@ -165,6 +168,7 @@ def load_state(path: str) -> Dict[str, Any]:
         state["conditional_preflight_by_token"], dict
     ):
         state["conditional_preflight_by_token"] = {}
+    ensure_runtime_health(state)
     return state
 
 

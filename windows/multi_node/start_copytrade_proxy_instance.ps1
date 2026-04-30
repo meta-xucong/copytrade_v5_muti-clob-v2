@@ -46,7 +46,7 @@ function ConvertTo-HashtableDeep {
         foreach ($item in $Value) {
             $items += ,(ConvertTo-HashtableDeep $item)
         }
-        return $items
+        return ,$items
     }
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
         $hash = [ordered]@{}
@@ -136,7 +136,12 @@ if (-not $SkipProxyPortCheck) {
 }
 $exitIp = ""
 if (-not $SkipExitIpCheck) {
-    $exitIp = Get-ExitIp -ProxyUrl $httpProxy
+    try {
+        $exitIp = Get-ExitIp -ProxyUrl $httpProxy
+    } catch {
+        Write-Warning $_.Exception.Message
+        Write-Warning "Continuing because proxy port check passed. Runtime network health will handle transient proxy/API failures."
+    }
 }
 
 $runtimeDir = Join-Path $root ("logs\instances\" + $Instance)

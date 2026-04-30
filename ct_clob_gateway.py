@@ -77,24 +77,43 @@ def _get_or_create_api_creds_v2(client: Any) -> Any:
     have a bound API key on the server.
     """
     derive = getattr(client, "derive_api_key", None)
-    if callable(derive):
-        try:
-            creds = derive()
-            if getattr(creds, "api_key", None):
-                return creds
-        except Exception:
-            pass
-
     create = getattr(client, "create_api_key", None)
-    if callable(create):
-        creds = create()
-        if getattr(creds, "api_key", None):
-            return creds
-
     create_or_derive = getattr(client, "create_or_derive_api_key", None)
-    if callable(create_or_derive):
-        return create_or_derive()
+    last_exc: Exception | None = None
 
+    for attempt in range(3):
+        if callable(derive):
+            try:
+                creds = derive()
+                if getattr(creds, "api_key", None):
+                    return creds
+            except Exception as exc:
+                last_exc = exc
+
+        if callable(create):
+            try:
+                creds = create()
+                if getattr(creds, "api_key", None):
+                    return creds
+            except Exception as exc:
+                last_exc = exc
+
+        # Some CLOB responses return "Could not create api key" during brief
+        # auth/backend races even though a derived key becomes available right
+        # after.  Try the SDK combined path and then loop back to derive.
+        if callable(create_or_derive):
+            try:
+                creds = create_or_derive()
+                if getattr(creds, "api_key", None):
+                    return creds
+            except Exception as exc:
+                last_exc = exc
+
+        if attempt < 2:
+            time.sleep(1.0 + attempt)
+
+    if last_exc is not None:
+        raise last_exc
     raise RuntimeError("V2 client does not expose an API credential bootstrap method")
 
 

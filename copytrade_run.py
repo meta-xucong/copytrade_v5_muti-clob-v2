@@ -58,6 +58,7 @@ from ct_data import (
 from ct_exec import (
     apply_actions,
     configure_clob_rate_limit,
+    configure_orderbook_provider,
     fetch_open_orders_norm,
     get_orderbook,
     reconcile_one,
@@ -68,6 +69,17 @@ from ct_resolver import (
     resolve_token_id,
 )
 from ct_risk import accumulator_check, risk_check
+from ct_runtime_health import (
+    begin_recovery,
+    classify_error,
+    complete_recovery,
+    ensure_runtime_health,
+    note_order_state_confirmed,
+    record_component_failure,
+    record_component_success,
+    should_pause_buys,
+    should_start_recovery,
+)
 from ct_state import load_state, save_state
 
 
@@ -812,7 +824,7 @@ def _fetch_all_target_positions(
 
             # Merge positions - take maximum for each token (apply per-target ratio)
             ratio = target_ratios.get(target_addr.lower(), 1.0)
-            blacklist = target_blacklists.get(target_addr.lower(), [])
+            blacklist = _normalize_token_blacklist(target_blacklists.get(target_addr.lower(), []))
             for pos in positions:
                 token_key = str(pos.get("token_key") or "")
                 if not token_key:
@@ -927,7 +939,9 @@ def _fetch_all_target_actions(
                 max_latest_ms = target_latest_ms
 
             # Add source target to each action (with per-target blacklist filter on BUY only)
-            blacklist = (target_blacklists or {}).get(target_addr.lower(), [])
+            blacklist = _normalize_token_blacklist(
+                (target_blacklists or {}).get(target_addr.lower(), [])
+            )
             skipped_blacklist = 0
             for action in actions:
                 action_copy = dict(action)
@@ -985,6 +999,26 @@ def _fetch_all_target_actions(
     return all_actions, merged_info
 
 
+def _normalize_token_blacklist(value: Any) -> List[str]:
+    """Return blacklist keywords without splitting a single string into characters."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    text = str(value).strip()
+    return [text] if text else []
+
+
 def _cfg_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -999,6 +1033,69 @@ def _cfg_bool(value: Any, default: bool = False) -> bool:
         if text in {"0", "false", "no", "n", "off", "disable", "disabled", ""}:
             return False
     return bool(value)
+
+
+def _token_id_from_row(row: Any) -> str:
+    if not isinstance(row, dict):
+        return ""
+    token_id = str(
+        row.get("token_id")
+        or row.get("asset")
+        or row.get("asset_id")
+        or ""
+    ).strip()
+    if token_id:
+        return token_id
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        return str(
+            raw.get("asset")
+            or raw.get("asset_id")
+            or raw.get("token_id")
+            or ""
+        ).strip()
+    return ""
+
+
+def _collect_ws_market_assets(
+    account_contexts: List[AccountContext],
+    *,
+    target_positions: Optional[List[Dict[str, Any]]] = None,
+    limit: int = 120,
+) -> List[str]:
+    assets: List[str] = []
+    seen: set[str] = set()
+
+    def add(token_id: Any) -> None:
+        if len(assets) >= limit:
+            return
+        text = str(token_id or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        assets.append(text)
+
+    for acct_ctx in account_contexts:
+        state = acct_ctx.state if isinstance(acct_ctx.state, dict) else {}
+        for order in state.get("open_orders_all") or []:
+            add(_token_id_from_row(order))
+        open_orders = state.get("open_orders")
+        if isinstance(open_orders, dict):
+            for token_id, orders in open_orders.items():
+                add(token_id)
+                if isinstance(orders, list):
+                    for order in orders:
+                        add(_token_id_from_row(order))
+        for pos in state.get("my_positions") or []:
+            add(_token_id_from_row(pos))
+        if len(assets) >= limit:
+            return assets
+
+    for pos in target_positions or []:
+        add(_token_id_from_row(pos))
+        if len(assets) >= limit:
+            break
+    return assets
 
 
 def _should_accept_buy_action_source(
@@ -1739,21 +1836,23 @@ def _run_hemostasis_recovery_startup(
     target_addresses: List[str],
     logger: logging.Logger,
     dry_run: bool = False,
-) -> None:
+) -> List[Dict[str, Any]]:
     if not _cfg_bool(cfg.get("hemostasis_recovery_enabled"), False):
-        return
+        return []
     if not account_contexts:
-        return
+        return []
+    reason = str(cfg.get("_hemostasis_reason") or "startup")
     try:
         sell_token_ids = _collect_target_sell_token_ids(cfg, data_client, target_addresses, logger)
     except Exception as exc:
         logger.warning("[HEMOSTASIS] scan failed, skip recovery: %s", exc)
-        return
+        return []
     if not sell_token_ids:
         logger.info("[HEMOSTASIS] no target sell token found in lookback window; skip recovery")
-        return
+        return []
     logger.info(
-        "[HEMOSTASIS] startup begin accounts=%s sell_tokens=%s",
+        "[HEMOSTASIS] %s begin accounts=%s sell_tokens=%s",
+        reason,
         len(account_contexts),
         len(sell_token_ids),
     )
@@ -1828,13 +1927,135 @@ def _run_hemostasis_recovery_startup(
         )
         failed = sum(1 for item in summaries if str(item.get("status")) in {"exception", "fetch_positions_failed"})
         logger.info(
-            "[HEMOSTASIS] startup_summary accounts=%s cleared=%s remained=%s failed=%s",
+            "[HEMOSTASIS] %s_summary accounts=%s cleared=%s remained=%s failed=%s",
+            reason,
             len(summaries),
             cleared,
             remained,
             failed,
         )
-    logger.info("[HEMOSTASIS] startup complete")
+    logger.info("[HEMOSTASIS] %s complete", reason)
+    return summaries
+
+
+def _run_hemostasis_recovery_with_reason(
+    cfg: Dict[str, Any],
+    data_client: Any,
+    account_contexts: List[AccountContext],
+    target_addresses: List[str],
+    logger: logging.Logger,
+    *,
+    dry_run: bool = False,
+    reason: str = "startup",
+) -> List[Dict[str, Any]]:
+    old_reason = cfg.get("_hemostasis_reason")
+    cfg["_hemostasis_reason"] = reason
+    try:
+        return _run_hemostasis_recovery_startup(
+            cfg=cfg,
+            data_client=data_client,
+            account_contexts=account_contexts,
+            target_addresses=target_addresses,
+            logger=logger,
+            dry_run=dry_run,
+        )
+    finally:
+        if old_reason is None:
+            cfg.pop("_hemostasis_reason", None)
+        else:
+            cfg["_hemostasis_reason"] = old_reason
+
+
+def _run_light_resync_after_reconnect(
+    cfg: Dict[str, Any],
+    data_client: Any,
+    acct_ctx: AccountContext,
+    logger: logging.Logger,
+    now_ts: int,
+) -> Dict[str, Any]:
+    state = acct_ctx.state
+    try:
+        api_timeout_sec = float(cfg.get("api_timeout_sec") or 15.0)
+    except Exception:
+        api_timeout_sec = 15.0
+    if api_timeout_sec <= 0:
+        api_timeout_sec = None
+
+    summary: Dict[str, Any] = {
+        "account": str(acct_ctx.my_address),
+        "ok": False,
+        "open_orders_ok": False,
+        "my_positions_ok": False,
+        "errors": [],
+    }
+
+    read_client = getattr(acct_ctx, "clob_read_client", None) or acct_ctx.clob_client
+    remote_orders, orders_ok, orders_err = fetch_open_orders_norm(read_client, api_timeout_sec)
+    if orders_ok:
+        _merge_remote_open_orders_into_state(
+            state=state,
+            remote_orders=remote_orders,
+            now_ts=now_ts,
+            cfg=cfg,
+            logger=logger,
+            adopt_existing=True,
+        )
+        note_order_state_confirmed(state)
+        summary["open_orders_ok"] = True
+    else:
+        summary["errors"].append(f"open_orders:{orders_err}")
+
+    positions_limit = max(50, int(cfg.get("positions_limit") or 500))
+    positions_max_pages = max(1, int(cfg.get("positions_max_pages") or 20))
+    refresh_sec = int(cfg.get("target_positions_refresh_sec") or 25)
+    my_positions_force_http = _cfg_bool(cfg.get("my_positions_force_http"), False)
+    cache_bust_mode = str(cfg.get("target_cache_bust_mode") or "bucket")
+    header_keys = cfg.get("positions_cache_header_keys") or [
+        "Age",
+        "CF-Cache-Status",
+        "X-Cache",
+        "Via",
+        "Cache-Control",
+    ]
+    my_positions, my_info = fetch_positions_norm(
+        data_client,
+        str(acct_ctx.my_address),
+        0.0,
+        positions_limit=positions_limit,
+        positions_max_pages=positions_max_pages,
+        refresh_sec=refresh_sec if my_positions_force_http else None,
+        force_http=my_positions_force_http,
+        cache_bust_mode=cache_bust_mode,
+        header_keys=header_keys,
+    )
+    if bool(my_info.get("ok", True)) and not bool(my_info.get("incomplete", False)):
+        state["my_positions"] = list(my_positions)
+        summary["my_positions_ok"] = True
+    else:
+        summary["errors"].append(f"my_positions:{my_info.get('error_msg')}")
+
+    actions_source = str(cfg.get("actions_source") or "trades").lower()
+    cursor_key = "target_trades_cursor_ms" if actions_source in ("trade", "trades") else "target_actions_cursor_ms"
+    now_ms = int(now_ts * 1000)
+    replay_window_sec = int(
+        cfg.get("recovery_actions_replay_window_sec")
+        or cfg.get("ws_replay_window_sec")
+        or cfg.get("actions_replay_window_sec")
+        or 1800
+    )
+    if replay_window_sec > 0:
+        replay_from_ms = max(0, now_ms - replay_window_sec * 1000)
+        state["actions_replay_from_ms"] = replay_from_ms
+        if int(state.get(cursor_key) or 0) > replay_from_ms:
+            logger.info(
+                "[RECOVERY] replay_window account=%s key=%s replay_from_ms=%s",
+                _shorten_address(acct_ctx.my_address),
+                cursor_key,
+                replay_from_ms,
+            )
+
+    summary["ok"] = bool(summary["open_orders_ok"] and summary["my_positions_ok"])
+    return summary
 
 
 def _derive_api_creds(client):
@@ -2347,10 +2568,152 @@ def _refresh_managed_order_ids(state: Dict[str, Any]) -> None:
     state["managed_order_ids"] = sorted(managed_ids)
 
 
+def _merge_remote_open_orders_into_state(
+    state: Dict[str, Any],
+    remote_orders: List[Dict[str, Any]],
+    now_ts: int,
+    cfg: Dict[str, Any],
+    logger: logging.Logger,
+    *,
+    adopt_existing: bool = True,
+) -> Dict[str, Any]:
+    managed_ids = {str(order_id) for order_id in (state.get("managed_order_ids") or [])}
+    remote_by_token: Dict[str, list[dict]] = {}
+    order_ts_by_id = state.setdefault("order_ts_by_id", {})
+    if not isinstance(order_ts_by_id, dict):
+        order_ts_by_id = {}
+        state["order_ts_by_id"] = order_ts_by_id
+    remote_order_ids: set[str] = set()
+    for order in remote_orders or []:
+        order_id = str(order["order_id"])
+        ts = order.get("ts") or order_ts_by_id.get(order_id) or now_ts
+        remote_order_ids.add(order_id)
+        order_payload = {
+            "order_id": order_id,
+            "side": order["side"],
+            "price": order["price"],
+            "size": order["size"],
+            "ts": int(ts),
+        }
+        remote_by_token.setdefault(order["token_id"], []).append(order_payload)
+
+    if adopt_existing and bool(cfg.get("adopt_existing_orders_on_boot", False)):
+        if not state.get("adopted_existing_orders", False):
+            if len(managed_ids) < 3:
+                adoptable_ids: set[str] = set()
+                for orders in remote_by_token.values():
+                    for order in orders:
+                        price = float(order.get("price") or 0.0)
+                        size = float(order.get("size") or 0.0)
+                        if price <= 0 or price > 1.0:
+                            continue
+                        if size <= 0:
+                            continue
+                        order_id = order.get("order_id")
+                        if order_id:
+                            adoptable_ids.add(str(order_id))
+                if adoptable_ids:
+                    logger.info(
+                        "[BOOT] adopt_existing_orders_on_boot: adopted=%s",
+                        len(adoptable_ids),
+                    )
+                    managed_ids |= adoptable_ids
+            state["adopted_existing_orders"] = True
+
+    prev_managed = state.get("open_orders")
+    if not isinstance(prev_managed, dict):
+        prev_managed = {}
+    managed_by_token: Dict[str, list[dict]] = {
+        str(token_id): [dict(order) for order in (orders or [])]
+        for token_id, orders in prev_managed.items()
+    }
+
+    # Merge remote visibility into ledger without dropping unseen managed orders.
+    managed_index: Dict[str, tuple[str, int]] = {}
+    for t_id, orders in managed_by_token.items():
+        for i, o in enumerate(orders or []):
+            oid = str(o.get("order_id") or "")
+            if oid:
+                managed_index[oid] = (str(t_id), i)
+
+    for t_id, orders in remote_by_token.items():
+        for order in orders or []:
+            oid = str(order.get("order_id") or "")
+            if not oid or oid not in managed_ids:
+                continue
+
+            if oid not in order_ts_by_id:
+                order_ts_by_id[oid] = int(order.get("ts") or now_ts)
+            order["ts"] = int(order.get("ts") or order_ts_by_id.get(oid) or now_ts)
+
+            hit = managed_index.get(oid)
+            if hit:
+                t0, i0 = hit
+                try:
+                    managed_by_token[t0][i0].update(order)
+                except Exception:
+                    t_id_s = str(t_id)
+                    managed_by_token.setdefault(t_id_s, []).append(dict(order))
+                    managed_index[oid] = (t_id_s, len(managed_by_token[t_id_s]) - 1)
+            else:
+                t_id_s = str(t_id)
+                managed_by_token.setdefault(t_id_s, []).append(dict(order))
+                managed_index[oid] = (t_id_s, len(managed_by_token[t_id_s]) - 1)
+
+    grace_sec = int(cfg.get("order_visibility_grace_sec") or 180)
+    pruned = 0
+
+    for token_id, orders in list(managed_by_token.items()):
+        kept: list[dict] = []
+        for order in orders or []:
+            order_id = str(order.get("order_id") or "")
+            if not order_id or order_id not in managed_ids:
+                continue
+
+            ts = int(order.get("ts") or order_ts_by_id.get(order_id) or now_ts)
+            order["ts"] = ts
+
+            if order_id not in remote_order_ids and (now_ts - ts) > grace_sec:
+                pruned += 1
+                continue
+
+            kept.append(order)
+
+        if kept:
+            managed_by_token[token_id] = kept
+        else:
+            managed_by_token.pop(token_id, None)
+
+    managed_ids = _collect_order_ids(managed_by_token)
+
+    for order_id in list(order_ts_by_id.keys()):
+        if str(order_id) not in managed_ids:
+            order_ts_by_id.pop(order_id, None)
+
+    state["open_orders_all"] = remote_by_token
+    state["open_orders"] = managed_by_token
+    state["managed_order_ids"] = sorted(managed_ids)
+    state["remote_order_snapshot_ts"] = int(now_ts)
+
+    if pruned:
+        logger.info(
+            "[ORDSYNC] pruned_missing_after_grace=%s grace_sec=%s",
+            pruned,
+            grace_sec,
+        )
+    return {
+        "remote_by_token": remote_by_token,
+        "remote_order_ids": sorted(remote_order_ids),
+        "managed_order_ids": sorted(managed_ids),
+        "pruned": pruned,
+    }
+
+
 _MUST_EXIT_SOURCE_PRIORITY: Dict[str, int] = {
     "target_sell_action": 100,
     "topic_exit_signal": 80,
     "topic_exit_recover": 70,
+    "suspect_zero_recovery": 70,
     "sell_confirm_drop": 60,
     "hemostasis_candidate": 50,
     "hemostasis_seed": 40,
@@ -2420,6 +2783,118 @@ def _should_clear_stale_must_exit_on_buy(
     if not has_buy:
         return False
     return float(buy_sum or 0.0) >= max(0.0, float(min_target_buy_shares or 0.0))
+
+
+def _post_exit_reentry_guard_sec(cfg: Dict[str, Any]) -> int:
+    raw = cfg.get("post_exit_reentry_guard_sec")
+    if raw is None:
+        raw = cfg.get("must_exit_fresh_sell_window_sec") or 1800
+    try:
+        return max(0, int(raw or 0))
+    except Exception:
+        return 1800
+
+
+def _mark_post_exit_reentry_guard(
+    state: Dict[str, Any],
+    token_id: str,
+    now_ts: int,
+    cfg: Dict[str, Any],
+    *,
+    target_sell_ms: int = 0,
+    source: str = "",
+) -> None:
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return
+    guard_sec = _post_exit_reentry_guard_sec(cfg)
+    if guard_sec <= 0:
+        return
+    bucket = state.setdefault("post_exit_reentry_guard_by_token", {})
+    if not isinstance(bucket, dict):
+        bucket = {}
+        state["post_exit_reentry_guard_by_token"] = bucket
+    meta = bucket.get(token_id)
+    if not isinstance(meta, dict):
+        meta = {}
+    signal_ms = int(target_sell_ms or 0)
+    if signal_ms <= 0:
+        signal_ms = int(now_ts) * 1000
+    meta["ts"] = int(now_ts)
+    meta["until"] = max(int(meta.get("until") or 0), int(now_ts) + guard_sec)
+    meta["sell_ms"] = max(int(meta.get("sell_ms") or 0), signal_ms)
+    meta["source"] = str(source or meta.get("source") or "exit")
+    bucket[token_id] = meta
+
+
+def _prune_post_exit_reentry_guard(state: Dict[str, Any], now_ts: int) -> None:
+    bucket = state.get("post_exit_reentry_guard_by_token")
+    if not isinstance(bucket, dict):
+        state["post_exit_reentry_guard_by_token"] = {}
+        return
+    for token_id, meta in list(bucket.items()):
+        if not isinstance(meta, dict):
+            bucket.pop(token_id, None)
+            continue
+        until_ts = int(meta.get("until") or 0)
+        if until_ts <= 0 or now_ts >= until_ts:
+            bucket.pop(token_id, None)
+
+
+def _get_post_exit_reentry_guard(
+    state: Dict[str, Any],
+    token_id: str,
+    now_ts: int,
+) -> Optional[Dict[str, Any]]:
+    bucket = state.get("post_exit_reentry_guard_by_token")
+    if not isinstance(bucket, dict):
+        return None
+    meta = bucket.get(str(token_id or "").strip())
+    if not isinstance(meta, dict):
+        return None
+    if int(meta.get("until") or 0) <= int(now_ts or 0):
+        return None
+    return meta
+
+
+def _should_hold_post_exit_reentry_buy(
+    *,
+    state: Dict[str, Any],
+    token_id: str,
+    now_ts: int,
+    cfg: Dict[str, Any],
+    has_buy: bool,
+    buy_signal_ms: int,
+    buy_sum: float,
+    min_target_buy_shares: float,
+) -> tuple[bool, str, int]:
+    meta = _get_post_exit_reentry_guard(state, token_id, now_ts)
+    if not isinstance(meta, dict):
+        return False, "no_post_exit_guard", 0
+
+    until_ts = int(meta.get("until") or 0)
+    remaining = max(0, until_ts - int(now_ts or 0))
+    sell_ms = int(meta.get("sell_ms") or 0)
+    require_fresh_buy = _cfg_bool(cfg.get("post_exit_reentry_requires_fresh_buy"), True)
+    if not require_fresh_buy:
+        return True, "post_exit_guard", remaining
+
+    min_buy_shares = max(0.0, float(min_target_buy_shares or 0.0))
+    fresh_buy_after_sell = (
+        bool(has_buy)
+        and int(buy_signal_ms or 0) > max(0, sell_ms)
+        and float(buy_sum or 0.0) >= min_buy_shares
+    )
+    if not fresh_buy_after_sell:
+        return True, "post_exit_guard_no_fresh_buy", remaining
+
+    min_delay_sec = max(0, int(cfg.get("post_exit_reentry_min_delay_sec") or 0))
+    if min_delay_sec > 0 and sell_ms > 0:
+        elapsed_sec = (int(now_ts) * 1000 - sell_ms) / 1000.0
+        if elapsed_sec < min_delay_sec:
+            return True, "post_exit_guard_min_delay", remaining
+
+    return False, "fresh_buy_after_exit", remaining
 
 
 def _mark_must_exit_token(
@@ -2598,6 +3073,21 @@ def _finalize_exited_token_state(
         bucket = state["exit_finalization"]
     until_ts = int(now_ts) + hold_sec
     bucket[token_id] = {"ts": int(now_ts), "until": until_ts, "reason": str(reason or "")}
+    last_allowed_sell_ms = 0
+    last_allowed = state.get("last_allowed_target_sell_action_ts_by_token")
+    if isinstance(last_allowed, dict):
+        try:
+            last_allowed_sell_ms = int(last_allowed.get(token_id) or 0)
+        except Exception:
+            last_allowed_sell_ms = 0
+    _mark_post_exit_reentry_guard(
+        state,
+        token_id,
+        now_ts,
+        cfg,
+        target_sell_ms=last_allowed_sell_ms,
+        source=f"finalize:{reason or 'exit_complete'}",
+    )
 
     for key in (
         "must_exit_tokens",
@@ -3155,22 +3645,85 @@ def _load_accounts_from_file(accounts_file: Path, logger: logging.Logger) -> Lis
     return accounts
 
 
+def _is_runnable_account_cfg(acct_cfg: Dict[str, Any]) -> bool:
+    if not acct_cfg.get("enabled", True):
+        return False
+    my_address = str(acct_cfg.get("my_address") or "").strip()
+    private_key = str(acct_cfg.get("private_key") or "").strip()
+    if not my_address or _is_placeholder_addr(my_address):
+        return False
+    if not _is_evm_address(my_address):
+        return False
+    if not private_key or private_key.startswith("YOUR_PRIVATE_KEY"):
+        return False
+    return True
+
+
 def _count_runnable_accounts(accounts_cfg: List[Dict[str, Any]]) -> int:
     """Count accounts that are enabled and syntactically valid for startup."""
     runnable = 0
     for acct_cfg in accounts_cfg:
-        if not acct_cfg.get("enabled", True):
-            continue
-        my_address = str(acct_cfg.get("my_address") or "").strip()
-        private_key = str(acct_cfg.get("private_key") or "").strip()
-        if not my_address or _is_placeholder_addr(my_address):
-            continue
-        if not _is_evm_address(my_address):
-            continue
-        if not private_key or private_key.startswith("YOUR_PRIVATE_KEY"):
-            continue
-        runnable += 1
+        if _is_runnable_account_cfg(acct_cfg):
+            runnable += 1
     return runnable
+
+
+def _collect_runnable_account_identity(
+    cfg: Dict[str, Any],
+    base_dir: Path,
+    logger: logging.Logger,
+) -> tuple[List[str], Dict[str, str]]:
+    accounts_file_name = str(cfg.get("accounts_file") or "accounts.json")
+    accounts_file = base_dir / accounts_file_name
+    try:
+        accounts_cfg = _read_accounts_from_file(accounts_file)
+    except Exception as exc:
+        logger.warning("[WORKER] failed to collect global account ids: %s", exc)
+        return [], {}
+
+    account_ids: List[str] = []
+    name_by_id: Dict[str, str] = {}
+    for acct_cfg in accounts_cfg:
+        if not _is_runnable_account_cfg(acct_cfg):
+            continue
+        account_id = str(acct_cfg.get("my_address") or "").strip().lower()
+        if not account_id:
+            continue
+        account_ids.append(account_id)
+        name_by_id[account_id] = str(acct_cfg.get("name") or _shorten_address(account_id))
+    return account_ids, name_by_id
+
+
+def _pre_shard_account_configs(
+    accounts_cfg: List[Dict[str, Any]],
+    *,
+    worker_index: int,
+    worker_count: int,
+    logger: logging.Logger,
+) -> List[Dict[str, Any]]:
+    wc = max(1, int(worker_count))
+    if wc <= 1:
+        return accounts_cfg
+    wi = int(worker_index)
+    if wi < 0 or wi >= wc:
+        raise ValueError(f"Invalid worker_index={wi} for worker_count={wc}")
+
+    selected: List[Dict[str, Any]] = []
+    runnable_idx = 0
+    for acct_cfg in accounts_cfg:
+        if not _is_runnable_account_cfg(acct_cfg):
+            continue
+        if runnable_idx % wc == wi:
+            selected.append(acct_cfg)
+        runnable_idx += 1
+    logger.info(
+        "[WORKER] pre-init shard worker=%s/%s accounts=%s/%s",
+        wi + 1,
+        wc,
+        len(selected),
+        runnable_idx,
+    )
+    return selected
 
 
 def _resolve_auto_worker_count(
@@ -3221,6 +3774,10 @@ def _init_account_contexts(
     cfg: Dict[str, Any],
     base_dir: Path,
     logger: logging.Logger,
+    *,
+    worker_index: int = 0,
+    worker_count: int = 1,
+    pre_shard_before_init: bool = False,
 ) -> List[AccountContext]:
     """Initialize AccountContext for each enabled account in accounts.json."""
 
@@ -3228,6 +3785,14 @@ def _init_account_contexts(
     accounts_file_name = cfg.get("accounts_file", "accounts.json")
     accounts_file = base_dir / accounts_file_name
     accounts_cfg = _load_accounts_from_file(accounts_file, logger)
+    if pre_shard_before_init:
+        accounts_cfg = _pre_shard_account_configs(
+            accounts_cfg,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            logger=logger,
+        )
+    expected_runnable_accounts = _count_runnable_accounts(accounts_cfg)
 
     target_address = cfg["target_address"]
     contexts: List[AccountContext] = []
@@ -3341,6 +3906,7 @@ def _init_account_contexts(
         state.setdefault("cutover_rebuild_pending", False)
         state.setdefault("remote_order_snapshot_ts", 0)
         state.setdefault("collateral_preflight", {})
+        ensure_runtime_health(state)
         if isinstance(state.get("exit_sell_state"), dict) and state["exit_sell_state"]:
             logger.info(
                 "[STATE] account=%s clearing stale exit_sell_state entries=%s",
@@ -3366,6 +3932,14 @@ def _init_account_contexts(
         collateral_preflight["ts"] = int(time.time())
         state["collateral_preflight"] = collateral_preflight
         if collateral_preflight.get("ready") is False:
+            record_component_failure(
+                state,
+                "pusd_preflight",
+                "preflight",
+                str(collateral_preflight.get("message") or "pUSD collateral not ready"),
+                int(time.time()),
+                buy_pause_sec=3600,
+            )
             logger.warning(
                 "[PUSD_PREFLIGHT] account=%s ready=%s balance=%s allowance=%s msg=%s",
                 acct_name,
@@ -3382,11 +3956,21 @@ def _init_account_contexts(
                 )
                 continue
         elif collateral_preflight.get("ok") is False:
+            record_component_failure(
+                state,
+                "pusd_preflight",
+                "preflight",
+                str(collateral_preflight.get("message") or "pUSD preflight not ok"),
+                int(time.time()),
+                buy_pause_sec=3600,
+            )
             logger.warning(
                 "[PUSD_PREFLIGHT_WARN] account=%s msg=%s",
                 acct_name,
                 collateral_preflight.get("message"),
             )
+        else:
+            record_component_success(state, "pusd_preflight", int(time.time()))
 
         ctx = AccountContext(
             name=acct_name,
@@ -3409,6 +3993,17 @@ def _init_account_contexts(
             _shorten_address(my_address),
             follow_ratio,
             state_path.name,
+        )
+
+    if (
+        expected_runnable_accounts > 0
+        and len(contexts) < expected_runnable_accounts
+        and _cfg_bool(cfg.get("require_all_accounts_ready"), True)
+    ):
+        raise ValueError(
+            "Only initialized "
+            f"{len(contexts)}/{expected_runnable_accounts} runnable account(s); "
+            "require_all_accounts_ready=true"
         )
 
     if not contexts:
@@ -3452,7 +4047,9 @@ def main() -> None:
                 if _is_evm_address(addr_str) and not _is_placeholder_addr(addr_str):
                     target_addresses.append(addr_str)
                     target_ratios[addr_str.lower()] = 1.0
-                    target_blacklists[addr_str.lower()] = cfg.get("blacklist_token_keys") or []
+                    target_blacklists[addr_str.lower()] = _normalize_token_blacklist(
+                        cfg.get("blacklist_token_keys")
+                    )
                 else:
                     pass  # silently skip invalid address before logger init
             elif isinstance(item, dict):
@@ -3463,10 +4060,12 @@ def main() -> None:
                     target_addresses.append(addr_str)
                     target_ratios[addr_str.lower()] = ratio
                     per_target_bl = item.get("blacklist_token_keys")
-                    if isinstance(per_target_bl, list):
-                        target_blacklists[addr_str.lower()] = per_target_bl
+                    if per_target_bl is not None:
+                        target_blacklists[addr_str.lower()] = _normalize_token_blacklist(per_target_bl)
                     else:
-                        target_blacklists[addr_str.lower()] = cfg.get("blacklist_token_keys") or []
+                        target_blacklists[addr_str.lower()] = _normalize_token_blacklist(
+                            cfg.get("blacklist_token_keys")
+                        )
                 else:
                     pass  # silently skip invalid address before logger init
             else:
@@ -3486,7 +4085,9 @@ def main() -> None:
         if single_target and _is_evm_address(single_target) and not _is_placeholder_addr(single_target):
             target_addresses.append(str(single_target).strip())
             target_ratios[str(single_target).strip().lower()] = 1.0
-            target_blacklists[str(single_target).strip().lower()] = cfg.get("blacklist_token_keys") or []
+            target_blacklists[
+                str(single_target).strip().lower()
+            ] = _normalize_token_blacklist(cfg.get("blacklist_token_keys"))
 
     if not target_addresses:
         raise ValueError(
@@ -3538,50 +4139,64 @@ def main() -> None:
     # ============================================================
     # MULTI-ACCOUNT INITIALIZATION
     # ============================================================
-    all_account_contexts = _init_account_contexts(cfg, base_dir, logger)
-    all_enabled_account_ids_global: List[str] = [
-        str(acct.my_address or "").strip().lower()
-        for acct in all_account_contexts
-        if str(acct.my_address or "").strip()
-    ]
-    all_account_name_by_id: Dict[str, str] = {
-        str(acct.my_address or "").strip().lower(): str(acct.name or _shorten_address(acct.my_address))
-        for acct in all_account_contexts
-    }
-    effective_worker_count, retire_worker = _resolve_effective_worker_shard_count(
-        len(all_account_contexts),
-        effective_worker_count,
-        effective_worker_index,
+    all_enabled_account_ids_global, all_account_name_by_id = _collect_runnable_account_identity(
+        cfg,
+        base_dir,
+        logger,
     )
-    if retire_worker:
-        if args.worker_supervised:
-            logger.info(
-                "[WORKER] retiring worker=%s/%s after init valid_accounts=%s active_workers=%s",
-                effective_worker_index + 1,
-                max(1, _to_int(args.worker_count, 1)),
-                len(all_account_contexts),
-                effective_worker_count,
-            )
-            raise SystemExit(WORKER_RETIRED_EXIT_CODE)
-        raise ValueError(
-            f"Worker shard empty after account init: worker_index={effective_worker_index}, "
-            f"worker_count={effective_worker_count}, valid_accounts={len(all_account_contexts)}"
-        )
-    if effective_worker_count <= 0:
-        raise ValueError("No valid accounts configured or all accounts failed initialization")
-    if effective_worker_count != max(1, _to_int(args.worker_count, 1)):
-        logger.info(
-            "[WORKER] shrink after init configured=%s active=%s valid_accounts=%s",
-            max(1, _to_int(args.worker_count, 1)),
-            effective_worker_count,
-            len(all_account_contexts),
-        )
-    account_contexts = _apply_worker_shard(
-        all_account_contexts,
+    pre_shard_before_init = bool(args.worker_supervised and effective_worker_count > 1)
+    all_account_contexts = _init_account_contexts(
+        cfg,
+        base_dir,
+        logger,
         worker_index=effective_worker_index,
         worker_count=effective_worker_count,
-        logger=logger,
+        pre_shard_before_init=pre_shard_before_init,
     )
+    if pre_shard_before_init:
+        account_contexts = all_account_contexts
+        if not account_contexts:
+            logger.info(
+                "[WORKER] retiring worker=%s/%s before init; no account shard",
+                effective_worker_index + 1,
+                max(1, _to_int(args.worker_count, 1)),
+            )
+            raise SystemExit(WORKER_RETIRED_EXIT_CODE)
+    else:
+        effective_worker_count, retire_worker = _resolve_effective_worker_shard_count(
+            len(all_account_contexts),
+            effective_worker_count,
+            effective_worker_index,
+        )
+        if retire_worker:
+            if args.worker_supervised:
+                logger.info(
+                    "[WORKER] retiring worker=%s/%s after init valid_accounts=%s active_workers=%s",
+                    effective_worker_index + 1,
+                    max(1, _to_int(args.worker_count, 1)),
+                    len(all_account_contexts),
+                    effective_worker_count,
+                )
+                raise SystemExit(WORKER_RETIRED_EXIT_CODE)
+            raise ValueError(
+                f"Worker shard empty after account init: worker_index={effective_worker_index}, "
+                f"worker_count={effective_worker_count}, valid_accounts={len(all_account_contexts)}"
+            )
+        if effective_worker_count <= 0:
+            raise ValueError("No valid accounts configured or all accounts failed initialization")
+        if effective_worker_count != max(1, _to_int(args.worker_count, 1)):
+            logger.info(
+                "[WORKER] shrink after init configured=%s active=%s valid_accounts=%s",
+                max(1, _to_int(args.worker_count, 1)),
+                effective_worker_count,
+                len(all_account_contexts),
+            )
+        account_contexts = _apply_worker_shard(
+            all_account_contexts,
+            worker_index=effective_worker_index,
+            worker_count=effective_worker_count,
+            logger=logger,
+        )
     current_account_idx = 0  # Used for round-robin account selection
     all_account_ids: List[str] = [
         str(acct.my_address or "").strip().lower()
@@ -3624,6 +4239,7 @@ def main() -> None:
         state["open_orders"] = {}
         state["open_orders_all"] = []
         state["must_exit_tokens"] = {}
+        state["post_exit_reentry_guard_by_token"] = {}
         state["last_nonzero_my_shares"] = {}
         state["seen_action_ids"] = []
         state["target_actions_cursor_ms"] = 0
@@ -3680,6 +4296,7 @@ def main() -> None:
     state.setdefault("place_fail_until", {})
     state.setdefault("exit_sell_state", {})
     state.setdefault("exit_finalization", {})
+    state.setdefault("post_exit_reentry_guard_by_token", {})
     state.setdefault("sell_reconcile_lock_until", {})
     state.setdefault("missing_data_freeze", {})
     state.setdefault("resolver_fail_cache", {})
@@ -3691,6 +4308,7 @@ def main() -> None:
     state.setdefault("cutover_rebuild_pending", False)
     state.setdefault("remote_order_snapshot_ts", 0)
     state.setdefault("collateral_preflight", {})
+    ensure_runtime_health(state)
     if not isinstance(state.get("open_orders"), dict):
         state["open_orders"] = {}
     if not isinstance(state.get("open_orders_all"), dict):
@@ -3988,6 +4606,70 @@ def main() -> None:
         except Exception as exc:
             logger.warning("[HTTP_TIMEOUT] failed to set timeout=%s: %s", timeout_sec, exc)
 
+    ws_market_client: Any = None
+    last_ws_market_subscribe_ts = 0.0
+    last_ws_market_stats_ts = 0.0
+    ws_market_subscribe_refresh_sec = max(
+        10, int(cfg.get("ws_market_subscribe_refresh_sec") or 30)
+    )
+    ws_market_stats_interval_sec = max(
+        30, int(cfg.get("ws_market_stats_interval_sec") or 120)
+    )
+    ws_market_max_assets = max(1, int(cfg.get("ws_market_max_assets") or 120))
+    ws_market_orderbook_max_age_sec = max(
+        0.5, float(cfg.get("ws_market_orderbook_max_age_sec") or 5.0)
+    )
+    if _cfg_bool(cfg.get("ws_market_enabled"), False):
+        try:
+            from ct_ws_market import DEFAULT_MARKET_WS_URL, WSMarketDataClient
+
+            proxy_cfg = cfg.get("proxy_instance")
+            proxy_url = ""
+            if isinstance(proxy_cfg, dict):
+                proxy_url = str(proxy_cfg.get("http_proxy") or "").strip()
+            if not proxy_url:
+                proxy_url = str(
+                    os.environ.get("HTTP_PROXY")
+                    or os.environ.get("http_proxy")
+                    or ""
+                ).strip()
+            ws_market_client = WSMarketDataClient(
+                url=str(cfg.get("ws_market_url") or DEFAULT_MARKET_WS_URL),
+                proxy_url=proxy_url,
+                ping_interval_sec=int(cfg.get("ws_market_ping_interval_sec") or 10),
+                reconnect_backoff_max_sec=int(
+                    cfg.get("ws_market_reconnect_backoff_max_sec")
+                    or cfg.get("ws_reconnect_backoff_max_sec")
+                    or 60
+                ),
+                max_age_sec=ws_market_orderbook_max_age_sec,
+                logger=logger,
+            )
+            initial_assets = _collect_ws_market_assets(
+                account_contexts,
+                limit=ws_market_max_assets,
+            )
+            ws_market_client.start(initial_assets)
+            configure_orderbook_provider(
+                ws_market_client,
+                prefer=_cfg_bool(cfg.get("ws_market_orderbook_prefer"), True),
+                max_age_sec=ws_market_orderbook_max_age_sec,
+            )
+            logger.info(
+                "[WS_MARKET] enabled assets=%s max_assets=%s prefer=%s max_age=%.2f proxy=%s",
+                len(initial_assets),
+                ws_market_max_assets,
+                _cfg_bool(cfg.get("ws_market_orderbook_prefer"), True),
+                ws_market_orderbook_max_age_sec,
+                proxy_url or "env/default",
+            )
+        except Exception as exc:
+            ws_market_client = None
+            configure_orderbook_provider(None)
+            logger.warning("[WS_MARKET] init failed; using REST orderbook fallback: %s", exc)
+    else:
+        configure_orderbook_provider(None)
+
     # Optional startup recovery:
     # replay target SELL actions within a lookback window and force-sell matching holdings
     # before entering the normal copy-trading loop.
@@ -4028,6 +4710,7 @@ def main() -> None:
         now_wall = time.time()
         for acct_ctx_tmp in account_contexts:
             _prune_exit_finalization(acct_ctx_tmp.state, now_ts)
+            _prune_post_exit_reentry_guard(acct_ctx_tmp.state, now_ts)
 
         # ============================================================
         # SHARED TARGET DATA CACHE (cross-account)
@@ -4125,6 +4808,34 @@ def main() -> None:
         cached_positions, cached_target_info, cached_position_source = shared_target_cache["positions"]
         cached_actions, cached_actions_info = shared_target_cache["actions"]
         cached_actions_cursor_key = shared_target_cache["actions_cursor_key"]
+        if ws_market_client is not None:
+            if now_wall - last_ws_market_subscribe_ts >= ws_market_subscribe_refresh_sec:
+                try:
+                    ws_assets = _collect_ws_market_assets(
+                        account_contexts,
+                        target_positions=cached_positions,
+                        limit=ws_market_max_assets,
+                    )
+                    added = ws_market_client.subscribe(
+                        ws_assets,
+                        max_assets=ws_market_max_assets,
+                    )
+                    if added:
+                        logger.info(
+                            "[WS_MARKET] subscribed_new=%s total_candidates=%s",
+                            added,
+                            len(ws_assets),
+                        )
+                    last_ws_market_subscribe_ts = now_wall
+                except Exception as exc:
+                    logger.warning("[WS_MARKET] subscribe refresh failed: %s", exc)
+                    last_ws_market_subscribe_ts = now_wall
+            if now_wall - last_ws_market_stats_ts >= ws_market_stats_interval_sec:
+                try:
+                    logger.info("[WS_MARKET] stats=%s", ws_market_client.stats())
+                except Exception as exc:
+                    logger.warning("[WS_MARKET] stats failed: %s", exc)
+                last_ws_market_stats_ts = now_wall
 
         # ============================================================
         # MULTI-ACCOUNT: Select current account (round-robin)
@@ -4165,6 +4876,31 @@ def main() -> None:
                 len(account_contexts),
                 _shorten_address(acct_ctx.my_address),
                 acct_ctx.follow_ratio,
+            )
+
+        ensure_runtime_health(state)
+        if bool(cached_target_info.get("ok")) and not bool(cached_target_info.get("incomplete")):
+            record_component_success(state, "data_api_target_positions", now_ts)
+        else:
+            record_component_failure(
+                state,
+                "data_api_target_positions",
+                classify_error(cached_target_info.get("error_msg") or "target positions incomplete"),
+                str(cached_target_info.get("error_msg") or "target positions incomplete"),
+                now_ts,
+                buy_pause_sec=0,
+                affect_runtime_mode=False,
+            )
+        if bool(cached_actions_info.get("ok")) and not bool(cached_actions_info.get("incomplete")):
+            record_component_success(state, "data_api_target_actions", now_ts)
+        else:
+            record_component_failure(
+                state,
+                "data_api_target_actions",
+                classify_error(cached_actions_info.get("error_msg") or "target actions incomplete"),
+                str(cached_actions_info.get("error_msg") or "target actions incomplete"),
+                now_ts,
+                buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
             )
 
         # --- Daily log cleanup: run once per day at the configured hour ---
@@ -4216,135 +4952,40 @@ def main() -> None:
             cfg["follow_ratio"] = acct_ctx.follow_ratio
         api_timeout_sec = _get_api_timeout_sec()
         _configure_clob_http_timeout(api_timeout_sec)
-        managed_ids = {str(order_id) for order_id in (state.get("managed_order_ids") or [])}
         try:
             remote_orders, ok, err = fetch_open_orders_norm(clob_read_client, api_timeout_sec)
             if ok:
-                remote_by_token: Dict[str, list[dict]] = {}
-                order_ts_by_id = state.setdefault("order_ts_by_id", {})
-                remote_order_ids: set[str] = set()
-                for order in remote_orders:
-                    order_id = str(order["order_id"])
-                    ts = order.get("ts") or order_ts_by_id.get(order_id) or now_ts
-                    remote_order_ids.add(order_id)
-                    order_payload = {
-                        "order_id": order_id,
-                        "side": order["side"],
-                        "price": order["price"],
-                        "size": order["size"],
-                        "ts": int(ts),
-                    }
-                    remote_by_token.setdefault(order["token_id"], []).append(order_payload)
-                adopt_existing = bool(cfg.get("adopt_existing_orders_on_boot", False))
-                if adopt_existing and not state.get("adopted_existing_orders", False):
-                    if len(managed_ids) < 3:
-                        adoptable_ids: set[str] = set()
-                        for orders in remote_by_token.values():
-                            for order in orders:
-                                price = float(order.get("price") or 0.0)
-                                size = float(order.get("size") or 0.0)
-                                if price <= 0 or price > 1.0:
-                                    continue
-                                if size <= 0:
-                                    continue
-                                order_id = order.get("order_id")
-                                if order_id:
-                                    adoptable_ids.add(str(order_id))
-                        if adoptable_ids:
-                            logger.info(
-                                "[BOOT] adopt_existing_orders_on_boot: adopted=%s",
-                                len(adoptable_ids),
-                            )
-                            managed_ids |= adoptable_ids
-                    state["adopted_existing_orders"] = True
-                # --- begin: ORDSYNC ledger-first (fix eventual consistency) ---
-                prev_managed = state.get("open_orders")
-                if not isinstance(prev_managed, dict):
-                    prev_managed = {}
-                managed_by_token: Dict[str, list[dict]] = {
-                    str(token_id): [dict(order) for order in (orders or [])]
-                    for token_id, orders in prev_managed.items()
-                }
-
-                # Merge remote visibility into ledger WITHOUT dropping unseen managed orders.
-                # This makes order_visibility_grace_sec effective even when remote is partially consistent.
-                managed_index: Dict[str, tuple[str, int]] = {}
-                for t_id, orders in managed_by_token.items():
-                    for i, o in enumerate(orders or []):
-                        oid = str(o.get("order_id") or "")
-                        if oid:
-                            managed_index[oid] = (str(t_id), i)
-
-                for t_id, orders in remote_by_token.items():
-                    for order in orders or []:
-                        oid = str(order.get("order_id") or "")
-                        if not oid or oid not in managed_ids:
-                            continue
-
-                        if oid not in order_ts_by_id:
-                            order_ts_by_id[oid] = int(order.get("ts") or now_ts)
-                        order["ts"] = int(order.get("ts") or order_ts_by_id.get(oid) or now_ts)
-
-                        hit = managed_index.get(oid)
-                        if hit:
-                            t0, i0 = hit
-                            # Update the existing ledger order in-place (do NOT overwrite the whole token list)
-                            try:
-                                managed_by_token[t0][i0].update(order)
-                            except Exception:
-                                # Fallback if index drifted for any reason
-                                t_id_s = str(t_id)
-                                managed_by_token.setdefault(t_id_s, []).append(dict(order))
-                                managed_index[oid] = (t_id_s, len(managed_by_token[t_id_s]) - 1)
-                        else:
-                            t_id_s = str(t_id)
-                            managed_by_token.setdefault(t_id_s, []).append(dict(order))
-                            managed_index[oid] = (t_id_s, len(managed_by_token[t_id_s]) - 1)
-
-                grace_sec = int(cfg.get("order_visibility_grace_sec") or 180)
-                pruned = 0
-
-                for token_id, orders in list(managed_by_token.items()):
-                    kept: list[dict] = []
-                    for order in orders or []:
-                        order_id = str(order.get("order_id") or "")
-                        if not order_id or order_id not in managed_ids:
-                            continue
-
-                        ts = int(order.get("ts") or order_ts_by_id.get(order_id) or now_ts)
-                        order["ts"] = ts
-
-                        if order_id not in remote_order_ids and (now_ts - ts) > grace_sec:
-                            pruned += 1
-                            continue
-
-                        kept.append(order)
-
-                    if kept:
-                        managed_by_token[token_id] = kept
-                    else:
-                        managed_by_token.pop(token_id, None)
-
-                managed_ids = _collect_order_ids(managed_by_token)
-
-                for order_id in list(order_ts_by_id.keys()):
-                    if str(order_id) not in managed_ids:
-                        order_ts_by_id.pop(order_id, None)
-
-                state["open_orders_all"] = remote_by_token
-                state["open_orders"] = managed_by_token
-                state["managed_order_ids"] = sorted(managed_ids)
-
-                if pruned:
-                    logger.info(
-                        "[ORDSYNC] pruned_missing_after_grace=%s grace_sec=%s",
-                        pruned,
-                        grace_sec,
-                    )
-                # --- end: ORDSYNC ledger-first ---
+                record_component_success(state, "clob_open_orders", now_ts)
+                note_order_state_confirmed(state)
+                _merge_remote_open_orders_into_state(
+                    state=state,
+                    remote_orders=remote_orders,
+                    now_ts=now_ts,
+                    cfg=cfg,
+                    logger=logger,
+                    adopt_existing=True,
+                )
             else:
+                record_component_failure(
+                    state,
+                    "clob_open_orders",
+                    classify_error(err),
+                    str(err),
+                    now_ts,
+                    buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
+                    order_state_unknown=bool(state.get("managed_order_ids")),
+                )
                 logger.warning("[WARN] sync open orders failed: %s", err)
         except Exception as exc:
+            record_component_failure(
+                state,
+                "clob_open_orders",
+                classify_error(exc),
+                str(exc),
+                now_ts,
+                buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
+                order_state_unknown=bool(state.get("managed_order_ids")),
+            )
             logger.exception("[ERR] sync open orders failed: %s", exc)
         _prune_order_ts_by_id(state)
 
@@ -4684,6 +5325,14 @@ def main() -> None:
             trades_incomplete = bool(my_trades_info.get("incomplete", False))
             if not trades_ok or trades_incomplete:
                 state["my_trades_unreliable_until"] = now_ts + my_trades_unreliable_hold_sec
+                record_component_failure(
+                    state,
+                    "data_api_my_trades",
+                    classify_error(my_trades_info.get("error_msg") or "my trades incomplete"),
+                    str(my_trades_info.get("error_msg") or "my trades incomplete"),
+                    now_ts,
+                    buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
+                )
                 logger.warning(
                     "[MY_TRADES] unreliable ok=%s incomplete=%s hold_sec=%s",
                     trades_ok,
@@ -4692,11 +5341,20 @@ def main() -> None:
                 )
             else:
                 state["my_trades_unreliable_until"] = 0
+                record_component_success(state, "data_api_my_trades", now_ts)
             latest_trade_ms = int(my_trades_info.get("latest_ms") or 0)
             if latest_trade_ms > my_trades_cursor_ms:
                 state["my_trades_cursor_ms"] = latest_trade_ms
         except Exception as exc:
             state["my_trades_unreliable_until"] = now_ts + my_trades_unreliable_hold_sec
+            record_component_failure(
+                state,
+                "data_api_my_trades",
+                classify_error(exc),
+                str(exc),
+                now_ts,
+                buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
+            )
             logger.exception("[ERR] fetch my trades failed: %s", exc)
 
         has_new_actions = bool(actions_list)
@@ -4763,6 +5421,18 @@ def main() -> None:
         if len(my_pos) >= hard_cap:
             my_info["incomplete"] = True
             logger.info("[SAFE] my positions 鍙兘鎴柇(len>=hard_cap=%s), 璺宠繃鏈疆", hard_cap)
+        if bool(my_info.get("ok", True)) and not bool(my_info.get("incomplete", False)):
+            record_component_success(state, "data_api_my_positions", now_ts)
+            state["my_positions"] = list(my_pos)
+        else:
+            record_component_failure(
+                state,
+                "data_api_my_positions",
+                classify_error(my_info.get("error_msg") or "my positions incomplete"),
+                str(my_info.get("error_msg") or "my positions incomplete"),
+                now_ts,
+                buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
+            )
 
         closed_token_keys = state.get("closed_token_keys")
         if not isinstance(closed_token_keys, dict):
@@ -4840,6 +5510,15 @@ def main() -> None:
             last_heartbeat_ts = now_ts
 
         if not target_info.get("ok") or target_info.get("incomplete"):
+            record_component_failure(
+                state,
+                "data_api_target_positions",
+                classify_error(target_info.get("error_msg") or "target positions incomplete"),
+                str(target_info.get("error_msg") or "target positions incomplete"),
+                now_ts,
+                buy_pause_sec=0,
+                affect_runtime_mode=False,
+            )
             logger.warning("[SAFE] target positions incomplete; skipping this loop")
             save_state(args.state, state)
             current_account_idx = (current_account_idx + 1) % len(account_contexts)
@@ -4847,8 +5526,100 @@ def main() -> None:
             continue
 
         if not my_info.get("ok") or my_info.get("incomplete"):
+            record_component_failure(
+                state,
+                "data_api_my_positions",
+                classify_error(my_info.get("error_msg") or "my positions incomplete"),
+                str(my_info.get("error_msg") or "my positions incomplete"),
+                now_ts,
+                buy_pause_sec=int(cfg.get("network_buy_pause_sec") or 120),
+            )
             logger.warning("[SAFE] my positions incomplete; skipping this loop")
             save_state(args.state, state)
+            current_account_idx = (current_account_idx + 1) % len(account_contexts)
+            time.sleep(_get_poll_interval())
+            continue
+
+        if _cfg_bool(cfg.get("network_soft_fail_enabled"), True) and should_start_recovery(
+            state,
+            (
+                "clob_open_orders",
+                "data_api_target_positions",
+                "data_api_target_actions",
+                "data_api_my_positions",
+                "data_api_my_trades",
+            ),
+            now_ts,
+        ):
+            min_full_interval = int(cfg.get("network_full_reconcile_min_interval_sec") or 1800)
+            need_light, need_full = begin_recovery(
+                state,
+                now_ts,
+                full_reconcile_min_interval_sec=min_full_interval,
+            )
+            logger.warning(
+                "[RECOVERY] begin account=%s light=%s full=%s",
+                _shorten_address(current_my_address),
+                need_light,
+                need_full,
+            )
+            light_ok = True
+            if need_light and _cfg_bool(cfg.get("network_light_resync_on_recover"), True):
+                light_summary = _run_light_resync_after_reconnect(
+                    cfg=cfg,
+                    data_client=data_client,
+                    acct_ctx=acct_ctx,
+                    logger=logger,
+                    now_ts=now_ts,
+                )
+                light_ok = bool(light_summary.get("ok"))
+                if light_ok:
+                    logger.info(
+                        "[RECOVERY] light_resync ok account=%s open_orders=%s my_positions=%s",
+                        _shorten_address(current_my_address),
+                        light_summary.get("open_orders_ok"),
+                        light_summary.get("my_positions_ok"),
+                    )
+                else:
+                    logger.warning(
+                        "[RECOVERY] light_resync failed account=%s errors=%s",
+                        _shorten_address(current_my_address),
+                        light_summary.get("errors"),
+                    )
+
+            full_done = False
+            if (
+                light_ok
+                and need_full
+                and _cfg_bool(cfg.get("network_full_reconcile_on_recover"), True)
+                and _cfg_bool(cfg.get("hemostasis_recovery_enabled"), False)
+            ):
+                summaries = _run_hemostasis_recovery_with_reason(
+                    cfg=cfg,
+                    data_client=data_client,
+                    account_contexts=account_contexts,
+                    target_addresses=target_addresses,
+                    logger=logger,
+                    dry_run=bool(args.dry_run),
+                    reason="network_recovered",
+                )
+                full_done = True
+                logger.info(
+                    "[RECOVERY] full_reconcile done accounts=%s",
+                    len(summaries),
+                )
+            elif need_full:
+                state["runtime_health"]["needs_full_reconcile"] = False
+
+            complete_recovery(
+                state,
+                now_ts,
+                ok=light_ok,
+                light_resync_done=bool(need_light and light_ok),
+                full_reconcile_done=full_done,
+            )
+            save_state(args.state, state)
+            shared_target_cache = {}
             current_account_idx = (current_account_idx + 1) % len(account_contexts)
             time.sleep(_get_poll_interval())
             continue
@@ -5608,6 +6379,16 @@ def main() -> None:
                 "[MY_TRADES] unreliable freeze buys until=%s",
                 my_trades_unreliable_until,
             )
+        network_buy_paused, network_buy_pause_reason = (
+            should_pause_buys(state, now_ts)
+            if _cfg_bool(cfg.get("network_degraded_pause_buys"), True)
+            else (False, "")
+        )
+        if network_buy_paused:
+            logger.warning(
+                "[HEALTH] freeze buys reason=%s",
+                network_buy_pause_reason,
+            )
 
         max_per_condition = float(cfg.get("max_position_usd_per_condition") or 0.0)
         condition_planned_map: Dict[str, float] = {}
@@ -6113,6 +6894,14 @@ def main() -> None:
                             allowed_sell_ms
                         )
                         last_allowed_target_sell_ms = int(allowed_sell_ms)
+                    _mark_post_exit_reentry_guard(
+                        state,
+                        token_id,
+                        now_ts,
+                        cfg,
+                        target_sell_ms=last_allowed_target_sell_ms,
+                        source=f"target_sell:{sell_signal_reason}",
+                    )
                 else:
                     logger.info(
                         "[HOLD] token_id=%s reason=%s primary=%s sellers=%s need=%s",
@@ -6221,16 +7010,40 @@ def main() -> None:
                 # Suspect Zero Quarantine recovery
                 if phase == "SUSPECT_ZERO":
                     quarantine_sec = int(cfg.get("cleanup_quarantine_sec") or 300)
-                    if my_shares > eps or orders_t:
+                    post_exit_guard_active = (
+                        _get_post_exit_reentry_guard(state, token_id, now_ts) is not None
+                    )
+                    recent_allowed_sell = (
+                        last_allowed_target_sell_ms > 0
+                        and (now_ms - last_allowed_target_sell_ms)
+                        <= must_exit_fresh_sell_window_sec * 1000
+                    )
+                    if my_shares > eps or open_orders_count > 0:
                         # Position resurrected: API previously lied about zero
-                        resume_phase = "EXITING" if has_sell else "LONG"
+                        resume_exit = (
+                            has_sell
+                            or must_exit_active
+                            or open_sell_orders_count > 0
+                            or post_exit_guard_active
+                            or recent_allowed_sell
+                        )
+                        resume_phase = "EXITING" if resume_exit else "LONG"
                         st["phase"] = resume_phase
+                        if resume_exit:
+                            _mark_must_exit_token(
+                                state,
+                                token_id,
+                                now_ts,
+                                source="suspect_zero_recovery",
+                                target_sell_ms=last_allowed_target_sell_ms,
+                            )
                         logger.warning(
-                            "[RECOVERY] token_id=%s reason=position_resurrected phase=%s my_shares=%s orders=%s resume_exit",
+                            "[RECOVERY] token_id=%s reason=position_resurrected phase=%s my_shares=%s orders=%s resume_exit=%s",
                             token_id,
                             resume_phase,
                             my_shares,
-                            len(orders_t),
+                            open_orders_count,
+                            resume_exit,
                         )
                         topic_state[token_id] = st
                         phase = resume_phase
@@ -6932,6 +7745,52 @@ def main() -> None:
                             continue
                         if side == "BUY":
                             order_notional = abs(size) * price
+                            post_hold, post_reason, post_remain = _should_hold_post_exit_reentry_buy(
+                                state=state,
+                                token_id=token_id,
+                                now_ts=now_ts,
+                                cfg=cfg,
+                                has_buy=has_buy,
+                                buy_signal_ms=buy_signal_ms,
+                                buy_sum=buy_sum,
+                                min_target_buy_shares=must_exit_clear_on_buy_min_target_shares,
+                            )
+                            if post_hold:
+                                blocked_reasons.add(post_reason)
+                                dedup_key = f"HOLD:{token_id}:{post_reason}"
+                                should_log, suppressed = _log_dedup.should_log(dedup_key)
+                                if should_log:
+                                    msg = (
+                                        "[HOLD] token_id=%s reason=%s remain=%ss "
+                                        "has_buy=%s buy_sum=%.6f"
+                                    )
+                                    if suppressed > 0:
+                                        logger.info(
+                                            msg + " (suppressed %d)",
+                                            token_id,
+                                            post_reason,
+                                            post_remain,
+                                            has_buy,
+                                            buy_sum,
+                                            suppressed,
+                                        )
+                                    else:
+                                        logger.info(
+                                            msg,
+                                            token_id,
+                                            post_reason,
+                                            post_remain,
+                                            has_buy,
+                                            buy_sum,
+                                        )
+                                continue
+                            if post_reason == "fresh_buy_after_exit":
+                                state.get("post_exit_reentry_guard_by_token", {}).pop(token_id, None)
+                                logger.info(
+                                    "[REENTRY_BYPASS] token_id=%s reason=fresh_buy_after_exit buy_sum=%.6f",
+                                    token_id,
+                                    buy_sum,
+                                )
                             if topic_risk_overlay_enabled and topic_risk_level >= 1:
                                 cfg_for_topic_risk = cfg_lowp if is_lowp else cfg
                                 min_shares_cfg = float(cfg_for_topic_risk.get("min_order_shares") or 0.0)
@@ -8317,8 +9176,57 @@ def main() -> None:
                 if my_trades_unreliable and side == "BUY":
                     blocked_reasons.add("my_trades_unreliable")
                     continue
+                if network_buy_paused and side == "BUY":
+                    blocked_reasons.add(network_buy_pause_reason or "network_degraded")
+                    continue
                 if side == "BUY":
                     order_notional = abs(size) * price
+                    post_hold, post_reason, post_remain = _should_hold_post_exit_reentry_buy(
+                        state=state,
+                        token_id=token_id,
+                        now_ts=now_ts,
+                        cfg=cfg,
+                        has_buy=has_buy,
+                        buy_signal_ms=buy_signal_ms,
+                        buy_sum=buy_sum,
+                        min_target_buy_shares=must_exit_clear_on_buy_min_target_shares,
+                    )
+                    if post_hold:
+                        blocked_reasons.add(post_reason)
+                        dedup_key = f"HOLD:{token_id}:{post_reason}"
+                        should_log, suppressed = _log_dedup.should_log(dedup_key)
+                        if should_log:
+                            msg = (
+                                "[HOLD] token_id=%s reason=%s remain=%ss "
+                                "has_buy=%s buy_sum=%.6f"
+                            )
+                            if suppressed > 0:
+                                logger.info(
+                                    msg + " (suppressed %d)",
+                                    token_id,
+                                    post_reason,
+                                    post_remain,
+                                    has_buy,
+                                    buy_sum,
+                                    suppressed,
+                                )
+                            else:
+                                logger.info(
+                                    msg,
+                                    token_id,
+                                    post_reason,
+                                    post_remain,
+                                    has_buy,
+                                    buy_sum,
+                                )
+                        continue
+                    if post_reason == "fresh_buy_after_exit":
+                        state.get("post_exit_reentry_guard_by_token", {}).pop(token_id, None)
+                        logger.info(
+                            "[REENTRY_BYPASS] token_id=%s reason=fresh_buy_after_exit buy_sum=%.6f",
+                            token_id,
+                            buy_sum,
+                        )
                     if topic_risk_overlay_enabled and topic_risk_level >= 1:
                         cfg_for_topic_risk = cfg_lowp if is_lowp else cfg
                         min_shares_cfg = float(cfg_for_topic_risk.get("min_order_shares") or 0.0)

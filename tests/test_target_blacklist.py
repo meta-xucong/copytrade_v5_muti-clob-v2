@@ -2,6 +2,8 @@
 import sys
 import logging
 
+from copytrade_run import _normalize_token_blacklist
+
 logger = logging.getLogger("test_target_blacklist")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
@@ -18,7 +20,7 @@ def _fetch_all_target_positions_logic(
     all_positions_by_token = {}
     for target_addr, positions in positions_by_target.items():
         ratio = target_ratios.get(target_addr.lower(), 1.0)
-        blacklist = target_blacklists.get(target_addr.lower(), [])
+        blacklist = _normalize_token_blacklist(target_blacklists.get(target_addr.lower(), []))
         for pos in positions:
             token_key = str(pos.get("token_key") or "")
             if not token_key:
@@ -91,8 +93,24 @@ def test_no_blacklist():
     print("[PASS] no_blacklist")
 
 
+def test_string_blacklist_is_single_keyword():
+    positions = {
+        "0xA": [
+            {"token_key": "tk1", "title": "Ethereum price up?", "size": 10.0},
+            {"token_key": "tk2", "title": "Bitcoin price up?", "size": 5.0},
+        ],
+    }
+    ratios = {"0xa": 1.0}
+    blacklists = {"0xa": "Bitcoin"}
+    merged = _fetch_all_target_positions_logic(positions, ratios, blacklists)
+    keys = {p["token_key"] for p in merged}
+    assert keys == {"tk1"}, f"String blacklist should not be split into chars: {keys}"
+    print("[PASS] string_blacklist_is_single_keyword")
+
+
 if __name__ == "__main__":
     test_per_target_blacklist()
     test_global_fallback_blacklist()
     test_no_blacklist()
+    test_string_blacklist_is_single_keyword()
     print("\nALL TARGET BLACKLIST TESTS PASSED")
