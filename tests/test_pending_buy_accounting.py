@@ -78,6 +78,47 @@ def test_taker_buy_updates_confirmed_accumulator(monkeypatch):
     assert abs(float(state["taker_buy_orders"][0]["usd"]) - 2.0) < 1e-9
 
 
+def test_taker_buy_blocks_against_accumulator_baseline(monkeypatch):
+    called = []
+
+    def fake_place_market_order(*_args, **_kwargs):
+        called.append(True)
+        return {"order_id": "taker-1", "response": {"ok": True}}
+
+    monkeypatch.setattr(ct_exec, "place_market_order", fake_place_market_order)
+
+    state = {"buy_notional_accumulator": {"tid-1": {"usd": 5.8}}}
+    updated = ct_exec.apply_actions(
+        client=object(),
+        actions=[
+            {
+                "type": "place",
+                "token_id": "tid-1",
+                "side": "BUY",
+                "price": 1.0,
+                "size": 1.0,
+                "_taker": True,
+            }
+        ],
+        open_orders=[],
+        now_ts=100,
+        dry_run=False,
+        cfg={
+            "allow_partial": True,
+            "max_position_usd_per_token": 6.0,
+            "taker_order_type": "FAK",
+            "taker_fak_retry_max": 0,
+        },
+        state=state,
+        planned_by_token_usd={"tid-1": 2.0},
+    )
+
+    assert called == []
+    assert updated == []
+    assert state["taker_blocked_count"] == 1
+    assert state["buy_notional_accumulator"]["tid-1"]["usd"] == 5.8
+
+
 def test_cancel_clears_pending_buy_order(monkeypatch):
     canceled = []
 

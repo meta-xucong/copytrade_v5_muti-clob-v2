@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+from ct_risk_config import normalize_risk_config
+
 
 def accumulator_check(
     token_id: str,
@@ -20,8 +22,9 @@ def accumulator_check(
     Args:
         local_delta: Accumulator delta from previous orders in the same batch
                      (to prevent batch bypass vulnerability)
-        planned_token_notional: Actual position value (shares * mid_price + open buy orders)
-                                 If provided, uses min(accumulator, planned) as baseline
+        planned_token_notional: Current token exposure estimate
+                                (position value + pending/open buy orders).
+                                BUY capacity uses max(planned, accumulator) as baseline.
 
     Returns:
         (ok, reason, available_notional)
@@ -33,22 +36,40 @@ def accumulator_check(
     if side_u != "BUY":
         return True, "ok", float("inf")
 
+    cfg = normalize_risk_config(cfg)
     max_total = float(cfg.get("accumulator_max_total_usd") or 0)
+    max_position_per_token = float(cfg.get("max_position_usd_per_token") or 0)
 
     accumulator = state.get("buy_notional_accumulator")
     accumulator_total_usd = 0.0
+    accumulator_token_usd = 0.0
+    token_id_s = str(token_id)
     if isinstance(accumulator, dict):
-        for acc_data in accumulator.values():
+        for acc_token_id, acc_data in accumulator.items():
             if isinstance(acc_data, dict):
-                accumulator_total_usd += float(acc_data.get("usd", 0.0))
+                acc_usd = float(acc_data.get("usd", 0.0))
+                accumulator_total_usd += acc_usd
+                if str(acc_token_id) == token_id_s:
+                    accumulator_token_usd += acc_usd
 
     # CRITICAL: Use actual position value if provided, otherwise use accumulator.
     # To prevent accumulator bypass when planned notional is temporarily missing,
     # use the larger of (planned, accumulator) as the baseline.
     # This still allows capacity to recover after sells/claims reduce holdings
     # while avoiding repeated buys when positions fail to sync.
+    planned_token_usd = (
+        float(planned_token_notional) if planned_token_notional is not None else 0.0
+    )
+    effective_token_current = max(planned_token_usd, accumulator_token_usd) + local_delta
+    if max_position_per_token > 0:
+        available = max_position_per_token - effective_token_current
+        if available <= 0:
+            return False, "max_position_usd_per_token", 0.0
+        if order_notional > available:
+            return False, "max_position_usd_per_token", available
+
     if planned_total_notional is not None:
-        effective_current = float(planned_total_notional) + local_delta
+        effective_current = max(float(planned_total_notional), accumulator_total_usd) + local_delta
     else:
         # Fallback to accumulator only (legacy behavior)
         effective_current = accumulator_total_usd + local_delta
@@ -80,8 +101,26 @@ def risk_check(
     cumulative_total_usd: Optional[float] = None,
     cumulative_token_usd: Optional[float] = None,
 ) -> Tuple[bool, str]:
+    cfg = normalize_risk_config(cfg)
+    side_u = str(side).upper() if side is not None else ""
+    allow_short = bool(cfg.get("allow_short", False))
+    max_per_token = float(cfg.get("max_notional_per_token") or 0)
+    max_position_per_token = float(cfg.get("max_position_usd_per_token") or 0)
+    order_notional = abs(order_shares) * ref_price if ref_price else 0.0
+
+    if side_u == "SELL":
+        sellable = float(available_shares) if available_shares is not None else float(my_shares)
+        if sellable > 0:
+            if float(order_shares) > sellable + 1e-9:
+                return False, "sell_exceeds_available"
+            return True, "ok"
+        if not allow_short:
+            return False, "no_sellable_shares"
+
+    # Topic/title filters are BUY filters. They must never block exits,
+    # must_exit, hemostasis, or any other sell-side risk-reduction path.
     blacklist = cfg.get("blacklist_token_keys") or []
-    if blacklist:
+    if blacklist and side_u in ("", "BUY"):
         token_title_l = (str(token_title).lower() if token_title is not None else "")
         for item in blacklist:
             if item is None:
@@ -93,20 +132,6 @@ def risk_check(
                 if item_str.lower() in token_title_l:
                     return False, "blacklist"
 
-    max_per_token = float(cfg.get("max_notional_per_token") or 0)
-    max_position_per_token = float(cfg.get("max_position_usd_per_token") or 0)
-    order_notional = abs(order_shares) * ref_price if ref_price else 0.0
-
-    side_u = str(side).upper() if side is not None else ""
-    allow_short = bool(cfg.get("allow_short", False))
-    if side_u == "SELL":
-        sellable = float(available_shares) if available_shares is not None else float(my_shares)
-        if sellable > 0:
-            if float(order_shares) > sellable + 1e-9:
-                return False, "sell_exceeds_available"
-            return True, "ok"
-        if not allow_short:
-            return False, "no_sellable_shares"
     apply_token_cap = side_u == "BUY" or (side_u == "SELL" and allow_short)
     if max_per_token > 0 and apply_token_cap:
         base_token = (

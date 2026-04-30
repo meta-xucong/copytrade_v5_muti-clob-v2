@@ -133,11 +133,12 @@ acc_ok, acc_reason, _ = accumulator_check("id1", 999.0, state_acc, cfg_acc, side
 assert acc_ok, acc_reason
 print("[PASS] accumulator_check SELL bypass")
 
-# 11) With planned_total_notional=0 (as in fresh boot), limit uses 0 baseline
+# 11) With planned_total_notional=0 (as in fresh boot), limit still honors accumulator
 acc_ok, acc_reason, avail = accumulator_check("id1", 10.0, state_acc, cfg_acc,
                                                side="BUY", local_delta=0.0,
                                                planned_total_notional=0.0)
-assert acc_ok and avail == float("inf"), acc_reason
-print("[PASS] accumulator_check respects planned_total_notional=0")
+assert not acc_ok and acc_reason == "accumulator_max_total_usd", acc_reason
+assert abs(avail - 5.0) < 1e-9
+print("[PASS] accumulator_check uses max(planned_total, accumulator_total)")
 
 print("\nALL LIMIT TESTS PASSED")

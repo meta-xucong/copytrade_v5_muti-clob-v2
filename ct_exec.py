@@ -17,6 +17,7 @@ from ct_clob_gateway import (
     place_market_order_v2,
     preflight_conditional_sell_ready_v2,
 )
+from ct_risk_config import normalize_risk_config
 from ct_utils import round_to_step, round_to_tick, safe_float
 
 
@@ -511,6 +512,7 @@ def reconcile_one(
     state: Dict[str, Any],
     planned_token_notional: float = 0.0,
 ) -> List[Dict[str, Any]]:
+    cfg = normalize_risk_config(cfg)
     actions: List[Dict[str, Any]] = []
     deadband = float(cfg.get("deadband_shares") or 0)
     delta = desired_shares - my_shares
@@ -1735,6 +1737,8 @@ def apply_actions(
     state: Optional[Dict[str, Any]] = None,
     planned_by_token_usd: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
+    if cfg is not None:
+        cfg = normalize_risk_config(cfg)
     updated = [dict(order) for order in open_orders]
     api_timeout_sec: Optional[float] = None
     if cfg is not None:
@@ -1992,17 +1996,31 @@ def apply_actions(
                 )
         try:
             if is_taker:
-                if side_u == "BUY" and cfg is not None and planned_by_token_usd is not None:
-                    max_per_token = float(cfg.get("max_notional_per_token") or 0.0)
+                if side_u == "BUY" and cfg is not None:
+                    max_per_token = float(cfg.get("max_position_usd_per_token") or 0.0)
                     if max_per_token > 0:
                         token_id_check = str(action.get("token_id"))
-                        planned = float(planned_by_token_usd.get(token_id_check, 0.0))
+                        planned = (
+                            float(planned_by_token_usd.get(token_id_check, 0.0))
+                            if planned_by_token_usd is not None
+                            else 0.0
+                        )
+                        accumulator_usd = 0.0
+                        if state is not None:
+                            accumulator = state.get("buy_notional_accumulator")
+                            if isinstance(accumulator, dict):
+                                acc_entry = accumulator.get(token_id_check)
+                                if isinstance(acc_entry, dict):
+                                    accumulator_usd = float(acc_entry.get("usd") or 0.0)
+                        risk_baseline = max(planned, accumulator_usd)
                         order_usd = abs(size) * price
-                        if planned + order_usd > max_per_token:
+                        if risk_baseline + order_usd > max_per_token:
                             logger.warning(
-                                "[TAKER_BLOCKED] token_id=%s would_exceed planned=%s order=%s max=%s",
+                                "[TAKER_BLOCKED] token_id=%s would_exceed baseline=%s planned=%s accumulator=%s order=%s max=%s",
                                 token_id_check,
+                                risk_baseline,
                                 planned,
+                                accumulator_usd,
                                 order_usd,
                                 max_per_token,
                             )

@@ -39,8 +39,7 @@ class AccountContext:
     state_path: Path
     clob_read_client: Any | None = None  # V2 read-first client during staged migration
     enabled: bool = True
-    max_notional_per_token: Optional[float] = None
-    max_notional_total: Optional[float] = None
+    risk_overrides: Dict[str, Any] | None = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -68,6 +67,12 @@ from ct_resolver import (
     gamma_fetch_topic_metadata_by_token_ids,
     market_tradeable_state,
     resolve_token_id,
+)
+from ct_risk_config import (
+    account_risk_overrides,
+    format_risk_config,
+    normalize_risk_config,
+    risk_signature,
 )
 from ct_risk import accumulator_check, risk_check
 from ct_runtime_health import (
@@ -4226,8 +4231,7 @@ def _init_account_contexts(
             state=state,
             state_path=state_path,
             enabled=True,
-            max_notional_per_token=acct_cfg.get("max_notional_per_token"),
-            max_notional_total=acct_cfg.get("max_notional_total"),
+            risk_overrides=account_risk_overrides(acct_cfg),
         )
         contexts.append(ctx)
 
@@ -4257,9 +4261,36 @@ def _init_account_contexts(
     return contexts
 
 
+def _effective_cfg_for_account(
+    root_cfg: Dict[str, Any],
+    acct_ctx: AccountContext,
+) -> Dict[str, Any]:
+    cfg = normalize_risk_config(root_cfg, acct_ctx.risk_overrides or {})
+    cfg["my_address"] = acct_ctx.my_address
+    cfg["follow_ratio"] = acct_ctx.follow_ratio
+    return cfg
+
+
+def _log_account_risk_config_once(
+    state: Dict[str, Any],
+    cfg: Dict[str, Any],
+    acct_name: str,
+    logger: logging.Logger,
+) -> None:
+    signature = risk_signature(cfg)
+    if state.get("risk_config_signature") == signature:
+        return
+    state["risk_config_signature"] = signature
+    logger.info(
+        "[RISK_CONFIG] account=%s %s",
+        acct_name,
+        format_risk_config(cfg),
+    )
+
+
 def main() -> None:
     args = _parse_args()
-    cfg = _load_config(Path(args.config))
+    cfg = normalize_risk_config(_load_config(Path(args.config)))
     arg_overrides: Dict[str, Any] = {}
     for key in (
         "target_address",
@@ -4472,10 +4503,11 @@ def main() -> None:
     )
 
     # For backward compatibility, use first account's settings as default
-    cfg["my_address"] = account_contexts[0].my_address
-    cfg["follow_ratio"] = account_contexts[0].follow_ratio
+    root_cfg = dict(cfg)
+    cfg = _effective_cfg_for_account(root_cfg, account_contexts[0])
     args.state = str(account_contexts[0].state_path)
     state = account_contexts[0].state
+    _log_account_risk_config_once(state, cfg, account_contexts[0].name, logger)
     # Safety: if user accidentally reuses a state file across targets, reset bootstrap-related fields.
     prev_target = str(state.get("target") or "").lower().strip()
     cur_target = str(cfg.get("target_address") or "").lower().strip()
@@ -4754,12 +4786,12 @@ def main() -> None:
         _suppress_verbose_third_party_loggers(level)
 
     def _reload_config(reason: str) -> None:
-        nonlocal cfg, last_config_reload_ts, last_config_mtime
+        nonlocal cfg, root_cfg, last_config_reload_ts, last_config_mtime
         nonlocal target_levels, target_level_skip_ratios
         nonlocal target_level_skip_log_path
         nonlocal target_level_seed
         try:
-            new_cfg = _load_config(Path(args.config))
+            new_cfg = normalize_risk_config(_load_config(Path(args.config)))
         except Exception as exc:
             logger.warning("[CFG] reload failed (%s): %s", reason, exc)
             last_config_reload_ts = time.time()
@@ -4785,7 +4817,8 @@ def main() -> None:
                 new_my,
             )
             new_cfg["my_address"] = resolved_my_address
-        cfg = new_cfg
+        root_cfg = dict(new_cfg)
+        cfg = dict(root_cfg)
         target_levels = _resolve_target_level_map(cfg, target_addresses)
         target_level_skip_ratios = _resolve_target_level_skip_ratios(cfg)
         target_level_skip_log_path = _resolve_target_level_skip_log_path(cfg, base_dir)
@@ -5120,9 +5153,9 @@ def main() -> None:
         clob_read_client = getattr(acct_ctx, "clob_read_client", None) or clob_client
         current_my_address = acct_ctx.my_address
         current_account_id = str(current_my_address or "").strip().lower()
-        cfg["my_address"] = current_my_address
-        cfg["follow_ratio"] = acct_ctx.follow_ratio
+        cfg = _effective_cfg_for_account(root_cfg, acct_ctx)
         args.state = str(acct_ctx.state_path)
+        _log_account_risk_config_once(state, cfg, acct_ctx.name, logger)
 
         # Ensure per-account state has run_start_ms and cursors initialized.
         if int(state.get("run_start_ms") or 0) <= 0:
@@ -5136,12 +5169,6 @@ def main() -> None:
             state["target_trades_cursor_ms"] = replay_floor_ms
         if int(state.get("target_trades_cursor_ms") or 0) < replay_floor_ms:
             state["target_trades_cursor_ms"] = replay_floor_ms
-
-        # Apply per-account config overrides
-        if acct_ctx.max_notional_per_token is not None:
-            cfg["max_notional_per_token"] = acct_ctx.max_notional_per_token
-        if acct_ctx.max_notional_total is not None:
-            cfg["max_notional_total"] = acct_ctx.max_notional_total
 
         if len(account_contexts) > 1:
             logger.info(
@@ -5222,8 +5249,8 @@ def main() -> None:
                 reason = "interval"
             _reload_config(reason)
             # MULTI-ACCOUNT: ensure per-account identity survives config reload.
-            cfg["my_address"] = acct_ctx.my_address
-            cfg["follow_ratio"] = acct_ctx.follow_ratio
+            cfg = _effective_cfg_for_account(root_cfg, acct_ctx)
+            _log_account_risk_config_once(state, cfg, acct_ctx.name, logger)
         api_timeout_sec = _get_api_timeout_sec()
         _configure_clob_http_timeout(api_timeout_sec)
         try:
@@ -8199,7 +8226,14 @@ def main() -> None:
                         if side == "BUY":
                             order_notional = abs(size) * price
                             cfg_for_acc = cfg_lowp if is_lowp else cfg
-                            planned_token_notional_for_acc = float(planned_by_token_usd.get(token_id, 0.0))
+                            planned_token_notional_for_acc = max(
+                                float(planned_by_token_usd.get(token_id, 0.0)),
+                                float(planned_by_token_usd_shadow.get(token_id, 0.0)),
+                            )
+                            planned_total_notional_for_acc = max(
+                                planned_total_notional,
+                                planned_total_notional_shadow,
+                            )
                             acc_ok, acc_reason, acc_available = accumulator_check(
                                 token_id,
                                 order_notional,
@@ -8208,7 +8242,7 @@ def main() -> None:
                                 side=side,
                                 local_delta=local_accumulator_delta,
                                 planned_token_notional=planned_token_notional_for_acc,
-                                planned_total_notional=planned_total_notional,
+                                planned_total_notional=planned_total_notional_for_acc,
                             )
                             if not acc_ok:
                                 # Get accumulator actual values for detailed logging
@@ -8345,7 +8379,7 @@ def main() -> None:
                                 act,
                                 max_notional_total,
                                 planned_total_notional_risk,
-                                float(cfg_for_action.get("max_notional_per_token") or 0.0),
+                                float(cfg_for_action.get("max_position_usd_per_token") or 0.0),
                                 planned_token_notional_risk,
                                 float(cfg_for_action.get("min_order_usd") or 0.0),
                                 float(cfg_for_action.get("min_order_shares") or 0.0),
@@ -8380,6 +8414,8 @@ def main() -> None:
                                     cfg_for_action,
                                     side=side,
                                     local_delta=local_accumulator_delta,
+                                    planned_token_notional=planned_token_notional_risk,
+                                    planned_total_notional=planned_total_notional_risk,
                                 )
                             )
                             if not acc_ok_shrink:
@@ -9633,7 +9669,14 @@ def main() -> None:
                 if side == "BUY":
                     order_notional = abs(size) * price
                     cfg_for_acc = cfg_lowp if is_lowp else cfg
-                    planned_token_notional_for_acc = float(planned_by_token_usd.get(token_id, 0.0))
+                    planned_token_notional_for_acc = max(
+                        float(planned_by_token_usd.get(token_id, 0.0)),
+                        float(planned_by_token_usd_shadow.get(token_id, 0.0)),
+                    )
+                    planned_total_notional_for_acc = max(
+                        planned_total_notional,
+                        planned_total_notional_shadow,
+                    )
                     acc_ok, acc_reason, acc_available = accumulator_check(
                         token_id,
                         order_notional,
@@ -9642,7 +9685,7 @@ def main() -> None:
                         side=side,
                         local_delta=local_accumulator_delta,
                         planned_token_notional=planned_token_notional_for_acc,
-                        planned_total_notional=planned_total_notional,
+                        planned_total_notional=planned_total_notional_for_acc,
                     )
                     if not acc_ok:
                         # Get accumulator actual values for detailed logging
@@ -9799,7 +9842,7 @@ def main() -> None:
                         act,
                         max_notional_total,
                         planned_total_notional_risk,
-                        float(cfg_for_action.get("max_notional_per_token") or 0.0),
+                        float(cfg_for_action.get("max_position_usd_per_token") or 0.0),
                         planned_token_notional,
                         float(cfg_for_action.get("min_order_usd") or 0.0),
                         float(cfg_for_action.get("min_order_shares") or 0.0),
@@ -9830,6 +9873,8 @@ def main() -> None:
                             cfg_for_action,
                             side=side,
                             local_delta=local_accumulator_delta,
+                            planned_token_notional=planned_token_notional,
+                            planned_total_notional=planned_total_notional_risk,
                         )
                     )
                     if not acc_ok_shrink:

@@ -49,8 +49,15 @@ for ($i = 1; $i -le $Count; $i++) {
                 private_key = "0xYOUR_PRIVATE_KEY"
                 follow_ratio = 0.1
                 enabled = $true
-                max_notional_per_token = 10000
-                max_notional_total = 10000
+                risk = [ordered]@{
+                    max_single_buy_usd = 6
+                    max_token_exposure_usd = 6
+                    max_condition_exposure_usd = 8
+                    max_event_exposure_usd = 8
+                    max_total_exposure_usd = 10000
+                    max_token_buy_spend_usd = $null
+                    max_total_buy_spend_usd = $null
+                }
             }
         )
     }
