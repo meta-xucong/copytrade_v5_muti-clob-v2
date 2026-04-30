@@ -37,14 +37,26 @@
                              },
                              {
                                  "address":  "0x9238743eeba8bbfe9e85ac7ba2e1e3d77877b73e",
-                                 "ratio":  0.44,
+                                 "ratio":  0.35,
                                  "level":  "B",
                                  "blacklist_token_keys":  [
                                                               "conflict ends",
                                                               "us forces enter",
                                                               "forces enter",
                                                               "meeting",
-                                                              "re-enter"
+                                                              "re-enter",
+                                                              "counter-strike",
+                                                              "blast",
+                                                              "map winner",
+                                                              "map handicap",
+                                                              "bo3",
+                                                              "furia",
+                                                              "faze",
+                                                              "navi",
+                                                              "gamerlegion",
+                                                              "vitality",
+                                                              "astralis",
+                                                              "fut esports"
                                                           ]
                              },
                              {
