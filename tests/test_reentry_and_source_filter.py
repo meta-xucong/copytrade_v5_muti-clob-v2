@@ -5,6 +5,7 @@ sys.path.insert(0, ".")
 from copytrade_run import (
     _should_accept_buy_action_source,
     _should_execute_sell_source_signal,
+    _should_force_exit_on_confirmed_target_drop,
     _should_hold_reentry_buy,
 )
 
@@ -187,6 +188,63 @@ def test_sell_source_stale_secondary_vote_expires():
     assert state["sell_source_votes"]["t1"] == {"0xccc": 2000}, state
 
 
+def test_confirmed_target_zero_forces_exit_when_holding():
+    force, reason, meta = _should_force_exit_on_confirmed_target_drop(
+        cfg={
+            "sell_confirm_exit_on_confirmed_drop": True,
+            "sell_confirm_exit_on_target_zero": True,
+            "sell_confirm_exit_min_drop_shares": 1.0,
+            "sell_confirm_exit_min_drop_ratio": 0.05,
+        },
+        d_target=-12.0,
+        t_last=12.0,
+        t_now=0.0,
+        my_shares=4.0,
+        open_orders_count=0,
+        sell_confirm_force_ratio=0.5,
+        sell_confirm_force_shares=0.0,
+    )
+    assert force is True and reason == "sell_confirm_target_zero", (force, reason, meta)
+
+
+def test_confirmed_target_drop_forces_exit_even_without_legacy_threshold():
+    force, reason, meta = _should_force_exit_on_confirmed_target_drop(
+        cfg={
+            "sell_confirm_exit_on_confirmed_drop": True,
+            "sell_confirm_exit_on_target_zero": True,
+            "sell_confirm_exit_min_drop_shares": 1.0,
+            "sell_confirm_exit_min_drop_ratio": 0.05,
+        },
+        d_target=-10.0,
+        t_last=0.0,
+        t_now=25.0,
+        my_shares=3.0,
+        open_orders_count=0,
+        sell_confirm_force_ratio=0.5,
+        sell_confirm_force_shares=0.0,
+    )
+    assert force is True and reason == "sell_confirm_position_drop", (force, reason, meta)
+
+
+def test_tiny_confirmed_target_drop_still_holds():
+    force, reason, meta = _should_force_exit_on_confirmed_target_drop(
+        cfg={
+            "sell_confirm_exit_on_confirmed_drop": True,
+            "sell_confirm_exit_on_target_zero": True,
+            "sell_confirm_exit_min_drop_shares": 1.0,
+            "sell_confirm_exit_min_drop_ratio": 0.05,
+        },
+        d_target=-0.2,
+        t_last=100.0,
+        t_now=99.8,
+        my_shares=3.0,
+        open_orders_count=0,
+        sell_confirm_force_ratio=0.5,
+        sell_confirm_force_shares=0.0,
+    )
+    assert force is False and reason == "drop_below_min_shares", (force, reason, meta)
+
+
 if __name__ == "__main__":
     test_reentry_hold_inside_window_without_force()
     test_reentry_bypass_on_force_signal()
@@ -196,4 +254,7 @@ if __name__ == "__main__":
     test_sell_source_waits_for_secondary_consensus()
     test_sell_source_two_secondary_votes_trigger_exit()
     test_sell_source_stale_secondary_vote_expires()
+    test_confirmed_target_zero_forces_exit_when_holding()
+    test_confirmed_target_drop_forces_exit_even_without_legacy_threshold()
+    test_tiny_confirmed_target_drop_still_holds()
     print("ALL REENTRY/SOURCE FILTER TESTS PASSED")

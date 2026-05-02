@@ -12,6 +12,7 @@ from copytrade_run import (
     _estimate_recovery_shares_from_state,
     _mark_must_exit_token,
     _mark_post_exit_reentry_guard,
+    _maybe_finalize_exited_token_state,
     _prune_post_exit_reentry_guard,
     _should_clear_stale_must_exit_on_buy,
     _should_clear_must_exit_without_inventory,
@@ -149,6 +150,118 @@ def test_exit_finalization_clears_tail_state_and_blocks_re_mark():
     assert "t1" not in state.get("must_exit_tokens", {}), state
     guard = _get_post_exit_reentry_guard(state, "t1", 1050)
     assert isinstance(guard, dict), state
+
+
+def test_exit_closeout_keeps_must_exit_when_inventory_remains():
+    logger = logging.getLogger("test_exit_closeout_inventory")
+    state = {
+        "must_exit_tokens": {
+            "t1": {"first_ts": 100, "last_ts": 100, "source": "target_sell_action"}
+        },
+        "exit_sell_state": {"t1": {"stage": 3}},
+    }
+    cfg = {
+        "exit_closeout_confirm_enabled": True,
+        "exit_closeout_confirm_rounds": 2,
+        "exit_closeout_confirm_interval_sec": 30,
+    }
+    finalized = _maybe_finalize_exited_token_state(
+        state=state,
+        token_id="t1",
+        now_ts=1000,
+        cfg=cfg,
+        logger=logger,
+        reason="zero_position_no_orders",
+        my_shares=1.25,
+        open_orders=[],
+        eps=1e-9,
+    )
+    assert finalized is False
+    assert "t1" in state.get("must_exit_tokens", {}), state
+    assert "t1" not in state.get("exit_finalization", {}), state
+    monitor = state.get("exit_closeout_monitor", {}).get("t1")
+    assert isinstance(monitor, dict), state
+    assert monitor.get("reason") == "inventory_or_open_orders", monitor
+    assert float(monitor.get("my_shares") or 0.0) == 1.25
+
+
+def test_exit_closeout_requires_repeated_zero_confirmation():
+    logger = logging.getLogger("test_exit_closeout_zero_confirm")
+    state = {
+        "must_exit_tokens": {
+            "t1": {"first_ts": 100, "last_ts": 100, "source": "target_sell_action"}
+        },
+        "last_nonzero_my_shares": {"t1": {"shares": 5.0, "ts": 100}},
+        "exit_sell_state": {"t1": {"stage": 3}},
+    }
+    cfg = {
+        "exit_closeout_confirm_enabled": True,
+        "exit_closeout_confirm_rounds": 2,
+        "exit_closeout_confirm_interval_sec": 30,
+        "exit_finalization_hold_sec": 180,
+    }
+    first = _maybe_finalize_exited_token_state(
+        state=state,
+        token_id="t1",
+        now_ts=1000,
+        cfg=cfg,
+        logger=logger,
+        reason="zero_position_no_orders",
+        my_shares=0.0,
+        open_orders=[],
+        eps=1e-9,
+    )
+    assert first is False
+    assert int(state.get("exit_closeout_monitor", {}).get("t1", {}).get("zero_confirmations") or 0) == 1
+    too_soon = _maybe_finalize_exited_token_state(
+        state=state,
+        token_id="t1",
+        now_ts=1010,
+        cfg=cfg,
+        logger=logger,
+        reason="zero_position_no_orders",
+        my_shares=0.0,
+        open_orders=[],
+        eps=1e-9,
+    )
+    assert too_soon is False
+    assert int(state.get("exit_closeout_monitor", {}).get("t1", {}).get("zero_confirmations") or 0) == 1
+    confirmed = _maybe_finalize_exited_token_state(
+        state=state,
+        token_id="t1",
+        now_ts=1030,
+        cfg=cfg,
+        logger=logger,
+        reason="zero_position_no_orders",
+        my_shares=0.0,
+        open_orders=[],
+        eps=1e-9,
+    )
+    assert confirmed is True
+    assert "t1" not in state.get("must_exit_tokens", {}), state
+    assert "t1" not in state.get("exit_sell_state", {}), state
+    assert "t1" not in state.get("exit_closeout_monitor", {}), state
+    assert int(state.get("exit_finalization", {}).get("t1", {}).get("until") or 0) == 1210
+
+
+def test_exit_closeout_waits_on_open_sell_order():
+    logger = logging.getLogger("test_exit_closeout_open_order")
+    state = {"must_exit_tokens": {"t1": {"first_ts": 100}}}
+    cfg = {"exit_closeout_confirm_enabled": True}
+    finalized = _maybe_finalize_exited_token_state(
+        state=state,
+        token_id="t1",
+        now_ts=1000,
+        cfg=cfg,
+        logger=logger,
+        reason="zero_position_no_orders",
+        my_shares=0.0,
+        open_orders=[{"side": "SELL", "size": 5.0, "order_id": "o1"}],
+        eps=1e-9,
+    )
+    assert finalized is False
+    assert "t1" in state.get("must_exit_tokens", {}), state
+    assert "t1" not in state.get("exit_finalization", {}), state
 
 
 def test_post_exit_reentry_guard_blocks_residual_position_buy():

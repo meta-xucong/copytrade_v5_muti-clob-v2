@@ -74,6 +74,22 @@
         "astralis",
         "fut esports"
       ],
+      "buy_block_token_keys": [
+        "russia capture",
+        "will russia capture",
+        "russia enter",
+        "will russia enter",
+        "russia x ukraine ceasefire",
+        "ukraine ceasefire",
+        "huliaipole",
+        "pokrovka",
+        "novooleksandrivka",
+        "novyi donbas",
+        "hryshyne",
+        "zelensky",
+        "zelenskyy",
+        "putin visit china"
+      ],
       "whitelist_topic_keys": [
         "sports",
         "us-politics"
@@ -102,6 +118,11 @@
         "meeting",
         "forces enter",
         "us forces enter"
+      ],
+      "buy_block_token_keys": [
+        "russia x ukraine ceasefire",
+        "ukraine ceasefire",
+        "ceasefire"
       ],
       "whitelist_topic_keys": [
         "geopolitics",
@@ -720,6 +741,10 @@
   "max_position_usd_per_condition": 8,
   "max_position_usd_per_event": 8,
   "max_notional_total": 10000,
+  "buy_price_guard_enabled": true,
+  "buy_price_guard_max_abs_deviation": 0.05,
+  "buy_price_guard_max_rel_deviation": 0.2,
+  "buy_price_guard_min_abs_deviation": 0.01,
   "accumulator_max_total_usd": 0,
   "accumulator_stale_reset_sec": 7200,
   "accumulator_zero_reconcile_sec": 300,
@@ -759,6 +784,12 @@
   "exit_no_bid_pause_rounds": 3,
   "exit_dead_book_pause_sec": 300,
   "exit_finalization_hold_sec": 180,
+  "exit_closeout_confirm_enabled": true,
+  "exit_closeout_confirm_rounds": 2,
+  "exit_closeout_confirm_interval_sec": 30,
+  "exit_closeout_min_shares": 0.0,
+  "exit_closeout_warn_after_sec": 300,
+  "exit_closeout_log_interval_sec": 120,
   "exit_sell_available_buffer_shares": 0.0,
   "exit_treat_below_min_as_dust": false,
   "cooldown_sec_per_token": 120,
@@ -773,6 +804,10 @@
   "sell_confirm_window_sec": 600,
   "sell_confirm_force_ratio": 0.5,
   "sell_confirm_force_shares": 0.0,
+  "sell_confirm_exit_on_confirmed_drop": true,
+  "sell_confirm_exit_on_target_zero": true,
+  "sell_confirm_exit_min_drop_shares": 1.0,
+  "sell_confirm_exit_min_drop_ratio": 0.05,
   "sell_source_consensus_enabled": true,
   "sell_primary_source_immediate_exit": true,
   "sell_secondary_consensus_count": 2,
@@ -808,6 +843,8 @@
   "allow_partial": true,
   "taker_enabled": true,
   "taker_spread_threshold": 0.01,
+  "buy_taker_max_spread": 0.01,
+  "buy_taker_require_known_spread": true,
   "taker_min_order_usd_buy": 1.0,
   "taker_min_order_shares_buy": 0.0,
   "taker_order_type": "FAK",

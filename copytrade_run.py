@@ -897,6 +897,7 @@ def _fetch_all_target_actions(
     taker_only: bool,
     logger: logging.Logger,
     target_blacklists: Dict[str, List[str]] | None = None,
+    target_buy_blocklists: Dict[str, List[str]] | None = None,
     target_whitelists: Dict[str, List[str]] | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
@@ -967,11 +968,16 @@ def _fetch_all_target_actions(
                         condition_ids_by_token=condition_ids_by_token,
                     )
 
-            # Add source target to each action (with per-target blacklist filter on BUY only)
+            # Add source target to each action.  BUY-only blocklists are intentionally
+            # separate from position blacklists so SELL/exit signals remain visible.
             blacklist = _normalize_token_blacklist(
                 (target_blacklists or {}).get(target_addr.lower(), [])
             )
+            buy_blocklist = _normalize_token_blacklist(
+                (target_buy_blocklists or {}).get(target_addr.lower(), [])
+            )
             skipped_blacklist = 0
+            skipped_buy_blocklist = 0
             skipped_whitelist = 0
             for action in actions:
                 action_copy = dict(action)
@@ -990,6 +996,15 @@ def _fetch_all_target_actions(
                     if any(str(bl_item).lower() in title_l for bl_item in blacklist if bl_item is not None):
                         skipped_blacklist += 1
                         continue
+                if buy_blocklist and side == "BUY":
+                    title_l = str(
+                        action_copy.get("title")
+                        or (action_copy.get("raw") or {}).get("title")
+                        or ""
+                    ).lower()
+                    if any(str(bl_item).lower() in title_l for bl_item in buy_blocklist if bl_item is not None):
+                        skipped_buy_blocklist += 1
+                        continue
                 if whitelist_enabled and side == "BUY" and not _topic_matches_whitelist(whitelist, topic_meta):
                     skipped_whitelist += 1
                     continue
@@ -998,6 +1013,12 @@ def _fetch_all_target_actions(
                 logger.debug(
                     "[MULTI-TARGET] Skipped %d blacklisted BUY actions from target=%s",
                     skipped_blacklist,
+                    _shorten_address(target_addr),
+                )
+            if skipped_buy_blocklist:
+                logger.debug(
+                    "[MULTI-TARGET] Skipped %d BUY-only blocked actions from target=%s",
+                    skipped_buy_blocklist,
                     _shorten_address(target_addr),
                 )
             if skipped_whitelist:
@@ -1311,6 +1332,73 @@ def _should_execute_sell_source_signal(
         vote_bucket.pop(token, None)
         return True, "secondary_source_consensus", secondary_sources
     return False, "secondary_source_consensus_wait", secondary_sources
+
+
+def _should_force_exit_on_confirmed_target_drop(
+    *,
+    cfg: Dict[str, Any],
+    d_target: float,
+    t_last: float,
+    t_now: Optional[float],
+    my_shares: float,
+    open_orders_count: int,
+    sell_confirm_force_ratio: float,
+    sell_confirm_force_shares: float,
+    eps: float = 1e-9,
+) -> tuple[bool, str, Dict[str, float]]:
+    """Decide whether repeated target-position drops should become an exit.
+
+    This handles the gap where actions are unreliable or no explicit SELL action
+    is visible, but the target position has repeatedly moved down while we still
+    have exposure.  SELL/exit should be easier to trigger than new BUY.
+    """
+    drop_shares = max(0.0, -float(d_target or 0.0))
+    base_shares = max(0.0, float(t_last or 0.0))
+    current_target_shares = max(0.0, float(t_now or 0.0)) if t_now is not None else 0.0
+    has_local_exposure = float(my_shares or 0.0) > eps or int(open_orders_count or 0) > 0
+
+    legacy_threshold = 0.0
+    if sell_confirm_force_ratio > 0 and base_shares > 0:
+        legacy_threshold = max(legacy_threshold, base_shares * sell_confirm_force_ratio)
+    if sell_confirm_force_shares > 0:
+        legacy_threshold = max(legacy_threshold, sell_confirm_force_shares)
+
+    meta = {
+        "drop_shares": drop_shares,
+        "base_shares": base_shares,
+        "current_target_shares": current_target_shares,
+        "legacy_threshold": legacy_threshold,
+        "min_drop_shares": max(0.0, float(cfg.get("sell_confirm_exit_min_drop_shares") or 0.0)),
+        "min_drop_ratio": max(0.0, float(cfg.get("sell_confirm_exit_min_drop_ratio") or 0.0)),
+        "my_shares": max(0.0, float(my_shares or 0.0)),
+        "open_orders_count": float(max(0, int(open_orders_count or 0))),
+    }
+
+    if drop_shares <= eps:
+        return False, "no_drop", meta
+    target_zero_enabled = _cfg_bool(cfg.get("sell_confirm_exit_on_target_zero"), True)
+    if target_zero_enabled and has_local_exposure and current_target_shares <= eps:
+        return True, "sell_confirm_target_zero", meta
+    if legacy_threshold > 0 and drop_shares >= legacy_threshold - 1e-12:
+        return True, "sell_confirm_drop_threshold", meta
+    if not _cfg_bool(cfg.get("sell_confirm_exit_on_confirmed_drop"), True):
+        return False, "confirmed_drop_exit_disabled", meta
+    if not has_local_exposure:
+        return False, "no_local_exposure", meta
+
+    min_drop_shares = float(meta["min_drop_shares"])
+    min_drop_ratio = float(meta["min_drop_ratio"])
+    if min_drop_shares > 0 and drop_shares < min_drop_shares - 1e-12:
+        return False, "drop_below_min_shares", meta
+    if base_shares > eps and min_drop_ratio > 0:
+        drop_ratio = drop_shares / base_shares
+        meta["drop_ratio"] = drop_ratio
+        if drop_ratio < min_drop_ratio - 1e-12:
+            return False, "drop_below_min_ratio", meta
+    else:
+        meta["drop_ratio"] = 0.0
+
+    return True, "sell_confirm_position_drop", meta
 
 
 def _topic_risk_decay_score(score: float, elapsed_sec: int, window_sec: int) -> float:
@@ -2960,6 +3048,8 @@ def _merge_remote_open_orders_into_state(
 
 _MUST_EXIT_SOURCE_PRIORITY: Dict[str, int] = {
     "target_sell_action": 100,
+    "exit_closeout_pending": 90,
+    "exit_closeout_dust": 90,
     "topic_exit_signal": 80,
     "topic_exit_recover": 70,
     "suspect_zero_recovery": 70,
@@ -3364,6 +3454,175 @@ def _finalize_exited_token_state(
     )
 
 
+def _exit_closeout_open_order_count(open_orders: Optional[List[Dict[str, Any]]]) -> int:
+    if not isinstance(open_orders, list):
+        return 0
+    return sum(1 for order in open_orders if isinstance(order, dict))
+
+
+def _exit_closeout_open_sell_order_count(open_orders: Optional[List[Dict[str, Any]]]) -> int:
+    if not isinstance(open_orders, list):
+        return 0
+    return sum(
+        1
+        for order in open_orders
+        if isinstance(order, dict) and str(order.get("side") or "").upper() == "SELL"
+    )
+
+
+def _exit_closeout_min_shares(cfg: Dict[str, Any], eps: float) -> float:
+    try:
+        configured = float(cfg.get("exit_closeout_min_shares") or 0.0)
+    except Exception:
+        configured = 0.0
+    return max(0.0, configured, float(eps or 0.0))
+
+
+def _get_exit_closeout_monitor(state: Dict[str, Any]) -> Dict[str, Any]:
+    monitor = state.setdefault("exit_closeout_monitor", {})
+    if not isinstance(monitor, dict):
+        monitor = {}
+        state["exit_closeout_monitor"] = monitor
+    return monitor
+
+
+def _record_exit_closeout_wait(
+    state: Dict[str, Any],
+    token_id: str,
+    now_ts: int,
+    cfg: Dict[str, Any],
+    logger: logging.Logger,
+    *,
+    reason: str,
+    my_shares: float,
+    open_order_count: int,
+    zero_confirmations: int = 0,
+    required_confirmations: int = 0,
+) -> None:
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return
+    monitor = _get_exit_closeout_monitor(state)
+    meta = monitor.get(token_id)
+    if not isinstance(meta, dict):
+        meta = {"first_ts": int(now_ts), "zero_confirmations": 0}
+    meta["last_ts"] = int(now_ts)
+    meta["reason"] = str(reason or "pending")
+    meta["my_shares"] = max(0.0, float(my_shares or 0.0))
+    meta["open_order_count"] = int(max(0, open_order_count))
+    if required_confirmations > 0:
+        meta["required_confirmations"] = int(required_confirmations)
+    if zero_confirmations >= 0:
+        meta["zero_confirmations"] = int(zero_confirmations)
+    monitor[token_id] = meta
+
+    warn_after = max(0, int(cfg.get("exit_closeout_warn_after_sec") or 300))
+    log_interval = max(1, int(cfg.get("exit_closeout_log_interval_sec") or 120))
+    first_ts = int(meta.get("first_ts") or now_ts)
+    last_log_ts = int(meta.get("last_log_ts") or 0)
+    should_log = last_log_ts <= 0 or now_ts - last_log_ts >= log_interval
+    if not should_log:
+        return
+    meta["last_log_ts"] = int(now_ts)
+    age = max(0, int(now_ts) - first_ts)
+    log_fn = logger.warning if warn_after > 0 and age >= warn_after else logger.info
+    log_fn(
+        "[EXIT_CLOSEOUT_WAIT] token_id=%s reason=%s age=%s my_shares=%s open_orders=%s zero_confirm=%s/%s",
+        token_id,
+        reason or "pending",
+        age,
+        max(0.0, float(my_shares or 0.0)),
+        int(max(0, open_order_count)),
+        int(max(0, zero_confirmations)),
+        int(max(0, required_confirmations)),
+    )
+
+
+def _maybe_finalize_exited_token_state(
+    state: Dict[str, Any],
+    token_id: str,
+    now_ts: int,
+    cfg: Dict[str, Any],
+    logger: logging.Logger,
+    reason: str,
+    *,
+    my_shares: float,
+    open_orders: Optional[List[Dict[str, Any]]],
+    eps: float,
+) -> bool:
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return False
+    if not _cfg_bool(cfg.get("exit_closeout_confirm_enabled"), True):
+        _finalize_exited_token_state(state, token_id, now_ts, cfg, logger, reason)
+        _get_exit_closeout_monitor(state).pop(token_id, None)
+        return True
+
+    min_shares = _exit_closeout_min_shares(cfg, eps)
+    current_shares = max(0.0, float(my_shares or 0.0))
+    open_order_count = _exit_closeout_open_order_count(open_orders)
+    open_sell_count = _exit_closeout_open_sell_order_count(open_orders)
+    if current_shares > min_shares or open_order_count > 0:
+        if current_shares > min_shares or open_sell_count > 0:
+            _mark_must_exit_token(
+                state,
+                token_id,
+                now_ts,
+                source="exit_closeout_pending",
+            )
+        _record_exit_closeout_wait(
+            state,
+            token_id,
+            now_ts,
+            cfg,
+            logger,
+            reason="inventory_or_open_orders",
+            my_shares=current_shares,
+            open_order_count=open_order_count,
+            zero_confirmations=0,
+            required_confirmations=max(1, int(cfg.get("exit_closeout_confirm_rounds") or 2)),
+        )
+        return False
+
+    required = max(1, int(cfg.get("exit_closeout_confirm_rounds") or 2))
+    interval = max(0, int(cfg.get("exit_closeout_confirm_interval_sec") or 30))
+    monitor = _get_exit_closeout_monitor(state)
+    meta = monitor.get(token_id)
+    if not isinstance(meta, dict):
+        meta = {"first_ts": int(now_ts), "zero_confirmations": 0}
+    last_zero_ts = int(meta.get("last_zero_ts") or 0)
+    zero_confirmations = int(meta.get("zero_confirmations") or 0)
+    if zero_confirmations <= 0 or interval <= 0 or now_ts - last_zero_ts >= interval:
+        zero_confirmations += 1
+        meta["zero_confirmations"] = int(zero_confirmations)
+        meta["last_zero_ts"] = int(now_ts)
+    meta["last_ts"] = int(now_ts)
+    meta["reason"] = "awaiting_zero_confirmations"
+    meta["my_shares"] = 0.0
+    meta["open_order_count"] = 0
+    meta["required_confirmations"] = int(required)
+    monitor[token_id] = meta
+
+    if zero_confirmations < required:
+        _record_exit_closeout_wait(
+            state,
+            token_id,
+            now_ts,
+            cfg,
+            logger,
+            reason="awaiting_zero_confirmations",
+            my_shares=0.0,
+            open_order_count=0,
+            zero_confirmations=zero_confirmations,
+            required_confirmations=required,
+        )
+        return False
+
+    monitor.pop(token_id, None)
+    _finalize_exited_token_state(state, token_id, now_ts, cfg, logger, reason)
+    return True
+
+
 def _intent_key(phase: str, desired_side: str, desired_shares: float) -> Dict[str, Any]:
     return {
         "phase": phase,
@@ -3436,6 +3695,71 @@ def _action_ms(action: Dict[str, object]) -> int:
     if isinstance(ts, datetime):
         return int(ts.timestamp() * 1000)
     return int(action.get("timestamp_ms") or action.get("ts") or 0)
+
+
+def _action_price(action: Dict[str, object]) -> float:
+    raw = action.get("raw") or {}
+    candidates = [action.get("price")]
+    if isinstance(raw, dict):
+        candidates.extend(
+            [
+                raw.get("price"),
+                raw.get("fillPrice"),
+                raw.get("avgPrice"),
+                raw.get("averagePrice"),
+            ]
+        )
+    for value in candidates:
+        try:
+            price = float(value)
+        except Exception:
+            continue
+        if price > 0:
+            return price
+    return 0.0
+
+
+def _buy_price_guard_decision(
+    order_price: float,
+    target_price: float,
+    cfg: Dict[str, Any],
+) -> tuple[bool, str, Dict[str, float]]:
+    if not _cfg_bool(cfg.get("buy_price_guard_enabled"), True):
+        return True, "disabled", {}
+    try:
+        order_price_f = float(order_price or 0.0)
+        target_price_f = float(target_price or 0.0)
+    except Exception:
+        return True, "invalid_price", {}
+    if order_price_f <= 0 or target_price_f <= 0:
+        return True, "missing_reference_price", {}
+    if order_price_f <= target_price_f:
+        return True, "not_worse_than_target", {
+            "order_price": order_price_f,
+            "target_price": target_price_f,
+            "abs_diff": 0.0,
+            "rel_diff": 0.0,
+        }
+
+    abs_diff = order_price_f - target_price_f
+    rel_diff = abs_diff / target_price_f if target_price_f > 0 else 0.0
+    max_abs = max(0.0, float(cfg.get("buy_price_guard_max_abs_deviation") or 0.0))
+    max_rel = max(0.0, float(cfg.get("buy_price_guard_max_rel_deviation") or 0.0))
+    min_abs_for_rel = max(0.0, float(cfg.get("buy_price_guard_min_abs_deviation") or 0.0))
+    abs_bad = max_abs > 0 and abs_diff > max_abs + 1e-12
+    rel_bad = max_rel > 0 and abs_diff >= min_abs_for_rel - 1e-12 and rel_diff > max_rel + 1e-12
+    meta = {
+        "order_price": order_price_f,
+        "target_price": target_price_f,
+        "abs_diff": abs_diff,
+        "rel_diff": rel_diff,
+        "max_abs": max_abs,
+        "max_rel": max_rel,
+        "min_abs_for_rel": min_abs_for_rel,
+    }
+    if abs_bad or rel_bad:
+        return False, "buy_price_deviation", meta
+    return True, "within_deviation", meta
 
 
 def _extract_token_id_from_raw(raw: object) -> Optional[str]:
@@ -4109,6 +4433,7 @@ def _init_account_contexts(
             state["open_orders_all"] = []
             state["must_exit_tokens"] = {}
             state["last_nonzero_my_shares"] = {}
+            state["exit_closeout_monitor"] = {}
             if boot_sync_mode == "baseline_only" or fresh_boot:
                 state["seen_action_ids"] = []
             state["target_actions_cursor_ms"] = 0
@@ -4145,6 +4470,7 @@ def _init_account_contexts(
         state.setdefault("place_fail_until", {})
         state.setdefault("exit_sell_state", {})
         state.setdefault("exit_finalization", {})
+        state.setdefault("exit_closeout_monitor", {})
         state.setdefault("sell_reconcile_lock_until", {})
         state.setdefault("missing_data_freeze", {})
         state.setdefault("resolver_fail_cache", {})
@@ -4314,9 +4640,11 @@ def main() -> None:
     target_addresses: List[str] = []
     target_ratios: Dict[str, float] = {}
     target_blacklists: Dict[str, List[str]] = {}
+    target_buy_blocklists: Dict[str, List[str]] = {}
     target_whitelists: Dict[str, List[str]] = {}
     whitelist_missing = object()
     global_whitelist = cfg.get("whitelist_topic_keys", whitelist_missing)
+    global_buy_blocklist = cfg.get("buy_block_token_keys")
     target_list = cfg.get("target_addresses")
     if isinstance(target_list, list) and target_list:
         for item in target_list:
@@ -4327,6 +4655,9 @@ def main() -> None:
                     target_ratios[addr_str.lower()] = 1.0
                     target_blacklists[addr_str.lower()] = _normalize_token_blacklist(
                         cfg.get("blacklist_token_keys")
+                    )
+                    target_buy_blocklists[addr_str.lower()] = _normalize_token_blacklist(
+                        global_buy_blocklist
                     )
                     if isinstance(global_whitelist, list):
                         target_whitelists[addr_str.lower()] = global_whitelist
@@ -4345,6 +4676,15 @@ def main() -> None:
                     else:
                         target_blacklists[addr_str.lower()] = _normalize_token_blacklist(
                             cfg.get("blacklist_token_keys")
+                        )
+                    per_target_buy_block = item.get("buy_block_token_keys")
+                    if per_target_buy_block is not None:
+                        target_buy_blocklists[addr_str.lower()] = _normalize_token_blacklist(
+                            per_target_buy_block
+                        )
+                    else:
+                        target_buy_blocklists[addr_str.lower()] = _normalize_token_blacklist(
+                            global_buy_blocklist
                         )
                     if "whitelist_topic_keys" in item:
                         per_target_wl = item.get("whitelist_topic_keys")
@@ -4375,6 +4715,9 @@ def main() -> None:
             target_blacklists[
                 str(single_target).strip().lower()
             ] = _normalize_token_blacklist(cfg.get("blacklist_token_keys"))
+            target_buy_blocklists[
+                str(single_target).strip().lower()
+            ] = _normalize_token_blacklist(global_buy_blocklist)
             if isinstance(global_whitelist, list):
                 target_whitelists[str(single_target).strip().lower()] = global_whitelist
 
@@ -4531,6 +4874,7 @@ def main() -> None:
         state["must_exit_tokens"] = {}
         state["post_exit_reentry_guard_by_token"] = {}
         state["last_nonzero_my_shares"] = {}
+        state["exit_closeout_monitor"] = {}
         state["seen_action_ids"] = []
         state["target_actions_cursor_ms"] = 0
         state["target_trades_cursor_ms"] = 0
@@ -4589,6 +4933,7 @@ def main() -> None:
     state.setdefault("place_fail_until", {})
     state.setdefault("exit_sell_state", {})
     state.setdefault("exit_finalization", {})
+    state.setdefault("exit_closeout_monitor", {})
     state.setdefault("post_exit_reentry_guard_by_token", {})
     state.setdefault("sell_reconcile_lock_until", {})
     state.setdefault("missing_data_freeze", {})
@@ -4632,6 +4977,8 @@ def main() -> None:
         state["probed_token_ids"] = []
     if not isinstance(state.get("exit_finalization"), dict):
         state["exit_finalization"] = {}
+    if not isinstance(state.get("exit_closeout_monitor"), dict):
+        state["exit_closeout_monitor"] = {}
     if not isinstance(state.get("ignored_tokens"), dict):
         state["ignored_tokens"] = {}
     if not isinstance(state.get("market_status_cache"), dict):
@@ -5028,6 +5375,12 @@ def main() -> None:
             tuple(
                 sorted(
                     (k, tuple(sorted(v)))
+                    for k, v in target_buy_blocklists.items()
+                )
+            ),
+            tuple(
+                sorted(
+                    (k, tuple(sorted(v)))
                     for k, v in target_whitelists.items()
                 )
             ),
@@ -5085,6 +5438,7 @@ def main() -> None:
                     taker_only=bool(cfg.get("actions_taker_only", False)),
                     logger=logger,
                     target_blacklists=target_blacklists,
+                    target_buy_blocklists=target_buy_blocklists,
                     target_whitelists=target_whitelists,
                 )
             except Exception as exc:
@@ -5295,6 +5649,7 @@ def main() -> None:
         buy_sum_by_token: Dict[str, float] = {}
         sell_sum_by_token: Dict[str, float] = {}
         buy_signal_source_by_token: Dict[str, str] = {}
+        buy_signal_price_by_token: Dict[str, float] = {}
         sell_signal_sources_by_token: Dict[str, Dict[str, int]] = {}
         buy_signal_ms_by_token: Dict[str, int] = {}
         sell_signal_ms_by_token: Dict[str, int] = {}
@@ -5324,6 +5679,18 @@ def main() -> None:
         sell_confirm_force_ratio = 0.5 if force_ratio_raw is None else float(force_ratio_raw)
         force_shares_raw = cfg.get("sell_confirm_force_shares")
         sell_confirm_force_shares = 0.0 if force_shares_raw is None else float(force_shares_raw)
+        sell_confirm_exit_on_confirmed_drop = _cfg_bool(
+            cfg.get("sell_confirm_exit_on_confirmed_drop"), True
+        )
+        sell_confirm_exit_on_target_zero = _cfg_bool(
+            cfg.get("sell_confirm_exit_on_target_zero"), True
+        )
+        sell_confirm_exit_min_drop_shares = max(
+            0.0, float(cfg.get("sell_confirm_exit_min_drop_shares") or 0.0)
+        )
+        sell_confirm_exit_min_drop_ratio = max(
+            0.0, float(cfg.get("sell_confirm_exit_min_drop_ratio") or 0.0)
+        )
         reentry_cooldown_sec = max(0, int(cfg.get("reentry_cooldown_sec") or 0))
         reentry_force_buy_shares = max(0.0, float(cfg.get("reentry_force_buy_shares") or 0.0))
         reentry_force_buy_usd = max(0.0, float(cfg.get("reentry_force_buy_usd") or 0.0))
@@ -5375,12 +5742,17 @@ def main() -> None:
             size: float,
             action_ms: int = 0,
             source_target: str = "",
+            price: float = 0.0,
         ) -> None:
             if not token_id or size <= 0:
                 return
             if side == "BUY":
                 has_buy_by_token[token_id] = True
                 buy_sum_by_token[token_id] = buy_sum_by_token.get(token_id, 0.0) + size
+                if price > 0:
+                    prev_ms = int(buy_signal_ms_by_token.get(token_id) or 0)
+                    if action_ms >= prev_ms:
+                        buy_signal_price_by_token[token_id] = float(price)
             elif side == "SELL":
                 has_sell_by_token[token_id] = True
                 sell_sum_by_token[token_id] = sell_sum_by_token.get(token_id, 0.0) + size
@@ -5449,6 +5821,7 @@ def main() -> None:
             side = str(action.get("side") or "").upper()
             size = float(action.get("size") or 0.0)
             action_ms = _action_ms(action)
+            action_price = _action_price(action)
             source_target = str(action.get("_source_target") or "").strip().lower()
 
             token_id = action.get("token_id") or _extract_token_id_from_raw(
@@ -5463,10 +5836,10 @@ def main() -> None:
                         source_target,
                         preferred_source,
                     ):
-                        buy_source_filtered += 1
-                        continue
+                            buy_source_filtered += 1
+                            continue
                 action["token_id"] = tid
-                _record_action(tid, side, size, action_ms, source_target)
+                _record_action(tid, side, size, action_ms, source_target, action_price)
                 if side == "BUY":
                     prev_action_ms = int(buy_signal_ms_by_token.get(tid) or 0)
                     if action_ms > 0 and action_ms >= prev_action_ms:
@@ -6230,7 +6603,7 @@ def main() -> None:
                         buy_source_filtered += 1
                         continue
                 size = float(action.get("size") or 0.0)
-                _record_action(tid, side, size)
+                _record_action(tid, side, size, _action_ms(action), source_target, _action_price(action))
                 continue
             if resolve_budget <= 0:
                 continue
@@ -6271,7 +6644,7 @@ def main() -> None:
                     buy_source_filtered += 1
                     continue
             token_map[str(token_key)] = tid
-            _record_action(tid, side, size)
+            _record_action(tid, side, size, _action_ms(action), source_target, _action_price(action))
             token_key_by_token_id.setdefault(tid, str(token_key))
 
         resolve_trade_budget = int(cfg.get("max_resolve_trades_per_loop") or 10)
@@ -6747,17 +7120,26 @@ def main() -> None:
                     in_quarantine = st_t.get("phase") == "SUSPECT_ZERO"
                     quarantine_expired = now_ts - st_t.get("cleanup_ts", now_ts) >= quarantine_sec
                     if in_quarantine and quarantine_expired:
-                        # Hard confirmed after quarantine
-                        topic_state.pop(tid, None)
-                        state.setdefault("sell_shares_accumulator", {}).pop(tid, None)
-                        _finalize_exited_token_state(
+                        finalized = _maybe_finalize_exited_token_state(
                             state=state,
                             token_id=tid,
                             now_ts=now_ts,
                             cfg=cfg,
                             logger=logger,
                             reason="zero_position_no_orders",
+                            my_shares=my_shares_t,
+                            open_orders=orders_t,
+                            eps=eps,
                         )
+                        if not finalized:
+                            topic_state[tid] = st_t
+                            logger.info(
+                                "[TOPIC] CLEANUP_WAIT token_id=%s reason=exit_closeout_confirmation",
+                                tid,
+                            )
+                            continue
+                        topic_state.pop(tid, None)
+                        state.setdefault("sell_shares_accumulator", {}).pop(tid, None)
                         logger.info(
                             "[TOPIC] CLEANUP_CONFIRMED token_id=%s reason=zero_position_no_orders quarantine=%s",
                             tid,
@@ -7293,19 +7675,28 @@ def main() -> None:
                     and (not action_seen)
                     and _should_clear_must_exit_without_inventory(state, token_id, now_ts, eps, cfg)
                 ):
-                    _finalize_exited_token_state(
+                    finalized = _maybe_finalize_exited_token_state(
                         state=state,
                         token_id=token_id,
                         now_ts=now_ts,
                         cfg=cfg,
                         logger=logger,
                         reason="no_inventory_no_orders",
+                        my_shares=my_shares,
+                        open_orders=open_orders,
+                        eps=eps,
                     )
-                    must_exit_active = False
-                    logger.info(
-                        "[MUST_EXIT] token_id=%s clear reason=no_inventory_no_orders",
-                        token_id,
-                    )
+                    if finalized:
+                        must_exit_active = False
+                        logger.info(
+                            "[MUST_EXIT] token_id=%s clear reason=no_inventory_no_orders",
+                            token_id,
+                        )
+                    else:
+                        logger.info(
+                            "[MUST_EXIT] token_id=%s keep reason=exit_closeout_confirmation",
+                            token_id,
+                        )
 
             # FIX: Only meaningful tokens should accumulate missing_streak / freeze.
             has_meaningful_state = (
@@ -7361,8 +7752,21 @@ def main() -> None:
                         topic_state[token_id] = st
                         phase = resume_phase
                     elif now_ts - st.get("cleanup_ts", now_ts) >= quarantine_sec:
-                        # Should have been hard-deleted in cleanup block; safety fallback
-                        topic_state.pop(token_id, None)
+                        finalized = _maybe_finalize_exited_token_state(
+                            state=state,
+                            token_id=token_id,
+                            now_ts=now_ts,
+                            cfg=cfg,
+                            logger=logger,
+                            reason="suspect_zero_no_inventory_no_orders",
+                            my_shares=my_shares,
+                            open_orders=open_orders,
+                            eps=eps,
+                        )
+                        if finalized:
+                            topic_state.pop(token_id, None)
+                        else:
+                            topic_state[token_id] = st
                         continue
 
                 if phase == "IDLE" and has_buy:
@@ -7482,26 +7886,77 @@ def main() -> None:
                         ):
                             is_dust = True
                     if is_dust:
-                        state.setdefault("dust_exits", {})[token_id] = {
-                            "ts": now_ts,
-                            "shares": my_shares,
-                        }
-                        topic_state.pop(token_id, None)
-                        must_exit_tokens.pop(token_id, None)
-                        phase = "IDLE"
-                        logger.info(
-                            "[TOPIC] DUST_RESET token_id=%s remaining=%s",
-                            token_id,
-                            my_shares,
-                        )
+                        if _cfg_bool(cfg.get("exit_closeout_confirm_enabled"), True):
+                            _mark_must_exit_token(
+                                state,
+                                token_id,
+                                now_ts,
+                                source="exit_closeout_dust",
+                                target_sell_ms=last_allowed_target_sell_ms,
+                            )
+                            _record_exit_closeout_wait(
+                                state,
+                                token_id,
+                                now_ts,
+                                cfg,
+                                logger,
+                                reason="dust_residual",
+                                my_shares=my_shares,
+                                open_order_count=open_orders_count,
+                                zero_confirmations=0,
+                                required_confirmations=max(
+                                    1, int(cfg.get("exit_closeout_confirm_rounds") or 2)
+                                ),
+                            )
+                            logger.warning(
+                                "[EXIT_CLOSEOUT_DUST] token_id=%s remaining=%s keep_exiting=1",
+                                token_id,
+                                my_shares,
+                            )
+                        else:
+                            state.setdefault("dust_exits", {})[token_id] = {
+                                "ts": now_ts,
+                                "shares": my_shares,
+                            }
+                            topic_state.pop(token_id, None)
+                            must_exit_tokens.pop(token_id, None)
+                            phase = "IDLE"
+                            logger.info(
+                                "[TOPIC] DUST_RESET token_id=%s remaining=%s",
+                                token_id,
+                                my_shares,
+                            )
 
                 if phase == "EXITING" and my_shares <= eps and open_orders_count == 0:
-                    topic_state.pop(token_id, None)
-                    must_exit_tokens.pop(token_id, None)
-                    last_nonzero_my_shares.pop(token_id, None)
-                    last_exit_ts_by_token[token_id] = int(now_ts)
-                    phase = "IDLE"
-                    logger.info("[TOPIC] RESET token_id=%s", token_id)
+                    finalized = _maybe_finalize_exited_token_state(
+                        state=state,
+                        token_id=token_id,
+                        now_ts=now_ts,
+                        cfg=cfg,
+                        logger=logger,
+                        reason="topic_exiting_zero_no_orders",
+                        my_shares=my_shares,
+                        open_orders=open_orders,
+                        eps=eps,
+                    )
+                    if finalized:
+                        topic_state.pop(token_id, None)
+                        must_exit_tokens.pop(token_id, None)
+                        last_nonzero_my_shares.pop(token_id, None)
+                        last_exit_ts_by_token[token_id] = int(now_ts)
+                        phase = "IDLE"
+                        logger.info("[TOPIC] RESET token_id=%s", token_id)
+                    else:
+                        st["phase"] = "SUSPECT_ZERO"
+                        st["cleanup_ts"] = st.get("cleanup_ts") or now_ts
+                        st["desired_shares"] = 0.0
+                        st["desired_side"] = "SELL"
+                        topic_state[token_id] = st
+                        phase = "SUSPECT_ZERO"
+                        logger.info(
+                            "[TOPIC] RESET_WAIT token_id=%s reason=exit_closeout_confirmation",
+                            token_id,
+                        )
 
             is_exiting = phase == "EXITING"
             topic_active = topic_mode and phase in ("LONG", "EXITING")
@@ -8787,6 +9242,7 @@ def main() -> None:
             actions_unreliable_until = int(state.get("actions_unreliable_until") or 0)
             actions_unreliable = actions_unreliable_until > now_ts
             force_exit_by_confirm_drop = False
+            force_exit_by_confirm_drop_reason = "sell_confirm_drop"
             if has_sell and d_target >= -eps:
                 d_target = -max(sell_sum, eps)
                 logger.info(
@@ -8836,39 +9292,49 @@ def main() -> None:
                             )
                             d_target = 0.0
                         else:
-                            drop_shares = max(0.0, -float(d_target))
-                            base_shares = max(0.0, float(t_last or 0.0))
-                            drop_threshold = 0.0
-                            if sell_confirm_force_ratio > 0 and base_shares > 0:
-                                drop_threshold = max(
-                                    drop_threshold, base_shares * sell_confirm_force_ratio
+                            significant_drop, drop_reason, drop_meta = (
+                                _should_force_exit_on_confirmed_target_drop(
+                                    cfg=cfg,
+                                    d_target=d_target,
+                                    t_last=float(t_last or 0.0),
+                                    t_now=t_now if t_now_present else None,
+                                    my_shares=my_shares,
+                                    open_orders_count=open_orders_count,
+                                    sell_confirm_force_ratio=sell_confirm_force_ratio,
+                                    sell_confirm_force_shares=sell_confirm_force_shares,
+                                    eps=eps,
                                 )
-                            if sell_confirm_force_shares > 0:
-                                drop_threshold = max(
-                                    drop_threshold, sell_confirm_force_shares
-                                )
-                            significant_drop = drop_threshold > 0 and drop_shares >= drop_threshold
+                            )
                             if significant_drop:
                                 logger.info(
-                                    "[FORCE] token_id=%s reason=sell_confirm_drop d_target=%s drop=%s threshold=%s ratio=%s base=%s",
+                                    "[FORCE] token_id=%s reason=%s d_target=%s drop=%s threshold=%s "
+                                    "base=%s current=%s my_shares=%s open_orders=%s min_drop=%s min_ratio=%s",
                                     token_id,
+                                    drop_reason,
                                     d_target,
-                                    drop_shares,
-                                    drop_threshold,
-                                    sell_confirm_force_ratio,
-                                    base_shares,
+                                    drop_meta.get("drop_shares"),
+                                    drop_meta.get("legacy_threshold"),
+                                    drop_meta.get("base_shares"),
+                                    drop_meta.get("current_target_shares"),
+                                    drop_meta.get("my_shares"),
+                                    int(drop_meta.get("open_orders_count") or 0),
+                                    drop_meta.get("min_drop_shares"),
+                                    drop_meta.get("min_drop_ratio"),
                                 )
                                 sell_confirm.pop(token_id, None)
                                 force_exit_by_confirm_drop = True
+                                force_exit_by_confirm_drop_reason = drop_reason
                             else:
                                 logger.info(
-                                    "[HOLD] token_id=%s reason=no_sell_after_confirm d_target=%s confirm=%s/%s drop=%s threshold=%s",
+                                    "[HOLD] token_id=%s reason=no_sell_after_confirm d_target=%s confirm=%s/%s "
+                                    "drop=%s threshold=%s force_reason=%s",
                                     token_id,
                                     d_target,
                                     token_confirm["count"],
                                     sell_confirm_max,
-                                    drop_shares,
-                                    drop_threshold,
+                                    drop_meta.get("drop_shares"),
+                                    drop_meta.get("legacy_threshold"),
+                                    drop_reason,
                                 )
                                 token_confirm["count"] = sell_confirm_max
                                 sell_confirm[token_id] = token_confirm
@@ -8887,7 +9353,7 @@ def main() -> None:
                     state,
                     token_id,
                     now_ts,
-                    source="sell_confirm_drop",
+                    source=force_exit_by_confirm_drop_reason,
                     target_sell_ms=int(last_target_sell_action_ts_by_token.get(token_id) or 0),
                 )
                 st = topic_state.get(token_id) or {}
@@ -8909,8 +9375,9 @@ def main() -> None:
                 is_exiting = True
                 topic_active = True
                 logger.info(
-                    "[FORCE] token_id=%s reason=sell_confirm_drop promote_to=EXITING my_shares=%s open_orders=%s",
+                    "[FORCE] token_id=%s reason=%s promote_to=EXITING my_shares=%s open_orders=%s",
                     token_id,
+                    force_exit_by_confirm_drop_reason,
                     my_shares,
                     open_orders_count,
                 )
@@ -9503,6 +9970,30 @@ def main() -> None:
                     continue
                 if side == "BUY":
                     order_notional = abs(size) * price
+                    target_buy_price = float(buy_signal_price_by_token.get(token_id, 0.0) or 0.0)
+                    price_guard_cfg = cfg_lowp if is_lowp else cfg
+                    price_ok, price_reason, price_meta = _buy_price_guard_decision(
+                        price,
+                        target_buy_price,
+                        price_guard_cfg,
+                    )
+                    if not price_ok:
+                        blocked_reasons.add(price_reason)
+                        logger.warning(
+                            "[BUY_PRICE_GUARD] token_id=%s reason=%s order_price=%.6f "
+                            "target_price=%.6f abs_diff=%.6f rel_diff=%.3f source=%s "
+                            "best_bid=%s best_ask=%s",
+                            token_id,
+                            price_reason,
+                            float(price_meta.get("order_price") or price),
+                            float(price_meta.get("target_price") or target_buy_price),
+                            float(price_meta.get("abs_diff") or 0.0),
+                            float(price_meta.get("rel_diff") or 0.0),
+                            _shorten_address(signal_source_target),
+                            best_bid,
+                            best_ask,
+                        )
+                        continue
                     post_hold, post_reason, post_remain = _should_hold_post_exit_reentry_buy(
                         state=state,
                         token_id=token_id,

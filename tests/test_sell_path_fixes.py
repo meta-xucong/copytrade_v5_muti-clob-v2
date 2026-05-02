@@ -24,6 +24,8 @@ def _base_cfg():
         "tick_size": 0.01,
         "taker_enabled": True,
         "taker_spread_threshold": 0.01,
+        "buy_taker_max_spread": 0.01,
+        "buy_taker_require_known_spread": True,
         "taker_min_order_usd_buy": 1.0,
         "taker_min_order_shares_buy": 0.0,
         "exit_full_sell": True,
@@ -356,6 +358,44 @@ def test_buy_taker_small_order_uses_taker_floor_not_maker_min():
     print("[PASS] buy_taker_small_order_uses_taker_floor_not_maker_min")
 
 
+def test_buy_taker_small_order_blocks_when_spread_wide():
+    cfg = _base_cfg()
+    state = {}
+    actions = reconcile_one(
+        token_id="t-buy-wide",
+        desired_shares=2.27,
+        my_shares=0.0,
+        orderbook={"best_bid": 0.20, "best_ask": 0.41},
+        open_orders=[],
+        now_ts=300,
+        cfg=cfg,
+        state=state,
+        planned_token_notional=0.0,
+    )
+    assert actions == [], actions
+    print("[PASS] buy_taker_small_order_blocks_when_spread_wide")
+
+
+def test_buy_maker_timeout_does_not_force_taker_when_spread_wide():
+    cfg = _base_cfg()
+    cfg["maker_max_wait_sec"] = 30
+    cfg["maker_timeout_max_spread"] = 0.03
+    state = {"order_ts_by_id": {"buy-1": 100}}
+    actions = reconcile_one(
+        token_id="t-timeout-wide",
+        desired_shares=8.0,
+        my_shares=0.0,
+        orderbook={"best_bid": 0.20, "best_ask": 0.41},
+        open_orders=[{"order_id": "buy-1", "side": "BUY", "price": 0.20, "size": 5.0}],
+        now_ts=200,
+        cfg=cfg,
+        state=state,
+        planned_token_notional=0.0,
+    )
+    assert actions == [], actions
+    print("[PASS] buy_maker_timeout_does_not_force_taker_when_spread_wide")
+
+
 def test_buy_maker_small_order_keeps_existing_maker_min_bump():
     cfg = _base_cfg()
     cfg["taker_enabled"] = False
@@ -390,5 +430,7 @@ if __name__ == "__main__":
     test_exit_state_clears_once_delta_settles()
     test_exit_stage3_stalled_wide_spread_pauses()
     test_buy_taker_small_order_uses_taker_floor_not_maker_min()
+    test_buy_taker_small_order_blocks_when_spread_wide()
+    test_buy_maker_timeout_does_not_force_taker_when_spread_wide()
     test_buy_maker_small_order_keeps_existing_maker_min_bump()
     print("\nALL SELL PATH FIX TESTS PASSED")

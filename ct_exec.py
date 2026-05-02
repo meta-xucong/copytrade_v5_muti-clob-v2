@@ -24,6 +24,46 @@ from ct_utils import round_to_step, round_to_tick, safe_float
 logger = logging.getLogger(__name__)
 
 
+def _cfg_bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "disable", "disabled", ""}:
+            return False
+    return bool(value)
+
+
+def _buy_taker_max_spread(cfg: Dict[str, Any], fallback: float) -> float:
+    raw = cfg.get("buy_taker_max_spread")
+    if raw is None:
+        raw = cfg.get("taker_spread_threshold")
+    value = safe_float(raw)
+    if value is None or value <= 0:
+        return max(0.0, float(fallback or 0.0))
+    return max(0.0, float(value))
+
+
+def _buy_taker_spread_allowed(
+    spread: Optional[float],
+    max_spread: float,
+    require_known_spread: bool,
+) -> tuple[bool, str]:
+    if spread is None:
+        if require_known_spread:
+            return False, "unknown_spread"
+        return True, "ok"
+    if max_spread > 0 and float(spread) > max_spread + 1e-12:
+        return False, "wide_spread"
+    return True, "ok"
+
+
 class _SimpleRateLimiter:
     def __init__(self, rps: float) -> None:
         self._lock = threading.Lock()
@@ -591,6 +631,10 @@ def reconcile_one(
         if market_tick_size and market_tick_size > 0:
             tick_size = market_tick_size
     taker_spread_thr = float(cfg.get("taker_spread_threshold") or 0.01)
+    buy_taker_max_spread = _buy_taker_max_spread(cfg, taker_spread_thr)
+    buy_taker_require_known_spread = _cfg_bool_value(
+        cfg.get("buy_taker_require_known_spread"), True
+    )
     taker_enabled = bool(cfg.get("taker_enabled", True))
     exit_stage1_wait = max(0, int(cfg.get("exit_stage1_wait_sec") or 45))
     exit_stage2_wait = max(0, int(cfg.get("exit_stage2_wait_sec") or 120))
@@ -684,12 +728,20 @@ def reconcile_one(
             spread = float(best_ask) - float(best_bid)
         except Exception:
             spread = None
-
-    use_taker = bool(
-        taker_enabled
-        and spread is not None
-        and spread <= (taker_spread_thr + 1e-12)
+    buy_taker_spread_ok, buy_taker_spread_reason = _buy_taker_spread_allowed(
+        spread,
+        buy_taker_max_spread,
+        buy_taker_require_known_spread,
     )
+
+    if side == "BUY":
+        use_taker = bool(taker_enabled and buy_taker_spread_ok and best_ask is not None)
+    else:
+        use_taker = bool(
+            taker_enabled
+            and spread is not None
+            and spread <= (taker_spread_thr + 1e-12)
+        )
     if exit_force_taker:
         spread_ok_for_exit = (
             spread is None
@@ -744,13 +796,15 @@ def reconcile_one(
                     return actions
     logger.debug(
         "[TAKER_CHECK] token_id=%s side=%s best_bid=%s best_ask=%s spread=%s thr=%s "
-        "taker_enabled=%s use_taker=%s open_orders=%s",
+        "buy_taker_max_spread=%s buy_taker_reason=%s taker_enabled=%s use_taker=%s open_orders=%s",
         token_id,
         side,
         best_bid,
         best_ask,
         spread,
         taker_spread_thr,
+        buy_taker_max_spread,
+        buy_taker_spread_reason,
         taker_enabled,
         use_taker,
         len(open_orders),
@@ -897,6 +951,17 @@ def reconcile_one(
     )
     if small_taker_override:
         if best_ask is None:
+            return actions
+        if not buy_taker_spread_ok:
+            logger.info(
+                "[BUY_TAKER_SPREAD_BLOCK] token_id=%s reason=small_order_%s "
+                "spread=%s max=%s require_known=%s; skip small BUY",
+                token_id,
+                buy_taker_spread_reason,
+                spread,
+                buy_taker_max_spread,
+                buy_taker_require_known_spread,
+            )
             return actions
         use_taker = True
         price = round_to_tick(float(best_ask), tick_size, direction="up")
@@ -1329,18 +1394,53 @@ def reconcile_one(
                     maker_max_wait_sec,
                 )
         if timed_out_orders:
-            max_spread = float(cfg.get("maker_timeout_max_spread") or 0.0)
-            if max_spread > 0 and spread is not None and spread > max_spread:
+            timeout_max_spread = float(cfg.get("maker_timeout_max_spread") or 0.0)
+            if buy_taker_max_spread > 0:
+                timeout_max_spread = (
+                    min(timeout_max_spread, buy_taker_max_spread)
+                    if timeout_max_spread > 0
+                    else buy_taker_max_spread
+                )
+            timeout_spread_ok, timeout_spread_reason = _buy_taker_spread_allowed(
+                spread,
+                timeout_max_spread,
+                buy_taker_require_known_spread,
+            )
+            if not timeout_spread_ok:
                 logger.info(
-                    "[MAKER_TIMEOUT_HOLD] token_id=%s wait=%ss spread=%s max=%s; keeping maker order",
+                    "[MAKER_TIMEOUT_HOLD] token_id=%s wait=%ss reason=%s spread=%s max=%s; keeping maker order",
                     token_id,
                     max_timeout_wait_sec or maker_max_wait_sec,
+                    timeout_spread_reason,
                     spread,
-                    max_spread,
+                    timeout_max_spread,
                 )
             else:
                 force_taker_for_timeout = True
                 use_taker = True
+                if side == "BUY" and best_ask is not None:
+                    price = round_to_tick(float(best_ask), tick_size, direction="up")
+
+    if side == "BUY" and use_taker:
+        final_spread_ok, final_spread_reason = _buy_taker_spread_allowed(
+            spread,
+            buy_taker_max_spread,
+            buy_taker_require_known_spread,
+        )
+        if not final_spread_ok:
+            logger.info(
+                "[BUY_TAKER_SPREAD_BLOCK] token_id=%s reason=final_%s spread=%s max=%s "
+                "require_known=%s; use maker/hold",
+                token_id,
+                final_spread_reason,
+                spread,
+                buy_taker_max_spread,
+                buy_taker_require_known_spread,
+            )
+            use_taker = False
+            force_taker_for_timeout = False
+            if small_taker_override:
+                return actions
 
     if open_orders:
         if use_taker or force_taker_for_timeout:
@@ -1372,7 +1472,7 @@ def reconcile_one(
                         ),
                         "_taker": True,
                         "_taker_spread": spread,
-                        "_taker_thr": taker_spread_thr,
+                        "_taker_thr": buy_taker_max_spread if side == "BUY" else taker_spread_thr,
                         **(
                             {
                                 "_exit_flow": True,
@@ -1526,7 +1626,7 @@ def reconcile_one(
                 {
                     "_taker": True,
                     "_taker_spread": spread,
-                    "_taker_thr": taker_spread_thr,
+                    "_taker_thr": buy_taker_max_spread if side == "BUY" else taker_spread_thr,
                 }
                 if use_taker
                 else {}

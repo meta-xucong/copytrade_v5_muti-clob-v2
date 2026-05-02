@@ -2,7 +2,7 @@ import sys
 import logging
 sys.path.insert(0, ".")
 from ct_risk import risk_check, accumulator_check
-from copytrade_run import _shrink_on_risk_limit
+from copytrade_run import _buy_price_guard_decision, _shrink_on_risk_limit
 
 logger = logging.getLogger("test")
 
@@ -140,5 +140,28 @@ acc_ok, acc_reason, avail = accumulator_check("id1", 10.0, state_acc, cfg_acc,
 assert not acc_ok and acc_reason == "accumulator_max_total_usd", acc_reason
 assert abs(avail - 5.0) < 1e-9
 print("[PASS] accumulator_check uses max(planned_total, accumulator_total)")
+
+# ---------- buy price guard ----------
+guard_cfg = {
+    "buy_price_guard_enabled": True,
+    "buy_price_guard_max_abs_deviation": 0.05,
+    "buy_price_guard_max_rel_deviation": 0.2,
+    "buy_price_guard_min_abs_deviation": 0.01,
+}
+
+# 12) target 0.40 vs order 0.62 must block
+ok, reason, meta = _buy_price_guard_decision(0.62, 0.40, guard_cfg)
+assert not ok and reason == "buy_price_deviation", (ok, reason, meta)
+print("[PASS] buy_price_guard blocks large slippage")
+
+# 13) small slippage remains allowed
+ok, reason, meta = _buy_price_guard_decision(0.43, 0.40, guard_cfg)
+assert ok, (ok, reason, meta)
+print("[PASS] buy_price_guard allows small slippage")
+
+# 14) unavailable target price should not block
+ok, reason, meta = _buy_price_guard_decision(0.62, 0.0, guard_cfg)
+assert ok and reason == "missing_reference_price", (ok, reason, meta)
+print("[PASS] buy_price_guard bypasses missing reference")
 
 print("\nALL LIMIT TESTS PASSED")

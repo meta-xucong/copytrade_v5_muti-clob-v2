@@ -2,7 +2,7 @@
 import sys
 import logging
 
-from copytrade_run import _normalize_token_blacklist
+from copytrade_run import _fetch_all_target_actions, _normalize_token_blacklist
 
 logger = logging.getLogger("test_target_blacklist")
 logger.setLevel(logging.INFO)
@@ -106,6 +106,50 @@ def test_string_blacklist_is_single_keyword():
     keys = {p["token_key"] for p in merged}
     assert keys == {"tk1"}, f"String blacklist should not be split into chars: {keys}"
     print("[PASS] string_blacklist_is_single_keyword")
+
+
+def test_buy_only_blocklist_blocks_buy_and_keeps_sell(monkeypatch):
+    import ct_data
+
+    actions = [
+        {
+            "token_id": "tok_buy",
+            "condition_id": "cond_buy",
+            "side": "BUY",
+            "timestamp_ms": 100,
+            "raw": {"title": "Will Russia capture Pokrovka by April 30?"},
+        },
+        {
+            "token_id": "tok_sell",
+            "condition_id": "cond_sell",
+            "side": "SELL",
+            "timestamp_ms": 200,
+            "raw": {"title": "Will Russia capture Pokrovka by April 30?"},
+        },
+    ]
+
+    def fake_fetch_target_actions_since(*_args, **_kwargs):
+        return list(actions), {"ok": True, "incomplete": False, "latest_ms": 200}
+
+    monkeypatch.setattr(ct_data, "fetch_target_actions_since", fake_fetch_target_actions_since)
+
+    merged, info = _fetch_all_target_actions(
+        data_client=object(),
+        target_addresses=["0xabc"],
+        cursor_ms=0,
+        use_trades_api=False,
+        page_size=10,
+        max_offset=10,
+        taker_only=False,
+        logger=logging.getLogger("test_buy_only_blocklist"),
+        target_blacklists={},
+        target_buy_blocklists={"0xabc": ["russia capture"]},
+        target_whitelists={},
+    )
+
+    assert info["ok"] is True
+    assert [item["side"] for item in merged] == ["SELL"]
+    print("[PASS] buy_only_blocklist_blocks_buy_and_keeps_sell")
 
 
 if __name__ == "__main__":
