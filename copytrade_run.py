@@ -899,6 +899,7 @@ def _fetch_all_target_actions(
     target_blacklists: Dict[str, List[str]] | None = None,
     target_buy_blocklists: Dict[str, List[str]] | None = None,
     target_whitelists: Dict[str, List[str]] | None = None,
+    scalper_guard_cfg: Dict[str, Any] | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch actions/trades from all target addresses and merge them.
@@ -979,7 +980,8 @@ def _fetch_all_target_actions(
             skipped_blacklist = 0
             skipped_buy_blocklist = 0
             skipped_whitelist = 0
-            for action in actions:
+            skipped_scalper_guard = 0
+            for action in sorted(actions, key=_target_action_timestamp_ms):
                 action_copy = dict(action)
                 action_copy["_source_target"] = target_addr
                 side = str(action_copy.get("side") or "").upper()
@@ -1008,6 +1010,13 @@ def _fetch_all_target_actions(
                 if whitelist_enabled and side == "BUY" and not _topic_matches_whitelist(whitelist, topic_meta):
                     skipped_whitelist += 1
                     continue
+                if _target_scalper_guard_should_block_buy(
+                    action_copy,
+                    scalper_guard_cfg,
+                    logger,
+                ):
+                    skipped_scalper_guard += 1
+                    continue
                 all_actions.append(action_copy)
             if skipped_blacklist:
                 logger.debug(
@@ -1027,6 +1036,12 @@ def _fetch_all_target_actions(
                     skipped_whitelist,
                     _shorten_address(target_addr),
                 )
+            if skipped_scalper_guard:
+                logger.info(
+                    "[MULTI-TARGET] Skipped %d scalper-guard BUY actions from target=%s",
+                    skipped_scalper_guard,
+                    _shorten_address(target_addr),
+                )
 
             if actions:
                 logger.debug(
@@ -1043,12 +1058,12 @@ def _fetch_all_target_actions(
             )
 
     # Sort by timestamp
-    all_actions.sort(key=lambda a: int(a.get("timestamp_ms") or a.get("ts") or 0))
+    all_actions.sort(key=_target_action_timestamp_ms)
 
     # Also check latest from merged actions (in case info.latest_ms wasn't set)
     if all_actions:
         last_action = all_actions[-1]
-        action_ts = int(last_action.get("timestamp_ms") or last_action.get("ts") or 0)
+        action_ts = _target_action_timestamp_ms(last_action)
         if action_ts > max_latest_ms:
             max_latest_ms = action_ts
 
@@ -1119,6 +1134,258 @@ def _topic_matches_whitelist(whitelist: Set[str], topic_meta: Dict[str, Any] | N
         if normalized
     }
     return bool(normalized_keys & whitelist)
+
+
+_SCALPER_GUARD_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+_SCALPER_GUARD_BLOCK_UNTIL_MS: Dict[str, int] = {}
+_SCALPER_GUARD_LAST_LOG_MS: Dict[str, int] = {}
+
+
+def _reset_scalper_guard_state() -> None:
+    """Test helper: clear in-memory source-token churn state."""
+    _SCALPER_GUARD_HISTORY.clear()
+    _SCALPER_GUARD_BLOCK_UNTIL_MS.clear()
+    _SCALPER_GUARD_LAST_LOG_MS.clear()
+
+
+def _target_action_timestamp_ms(action: Dict[str, Any]) -> int:
+    for key in ("timestamp_ms", "ts"):
+        try:
+            value = action.get(key)
+            if value is not None and value != "":
+                return int(float(value))
+        except Exception:
+            pass
+    value = action.get("timestamp") or action.get("time") or action.get("createdAt")
+    if value is None and isinstance(action.get("raw"), dict):
+        raw = action["raw"]
+        value = raw.get("timestamp") or raw.get("time") or raw.get("createdAt")
+    try:
+        if isinstance(value, datetime):
+            return int(value.timestamp() * 1000)
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if number > 1e12:
+                return int(number)
+            return int(number * 1000)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return int(datetime.fromisoformat(text).timestamp() * 1000)
+    except Exception:
+        return 0
+    return 0
+
+
+def _target_action_float(action: Dict[str, Any], *keys: str) -> float:
+    raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+    for key in keys:
+        try:
+            value = action.get(key)
+            if value is None and isinstance(raw, dict):
+                value = raw.get(key)
+            if value is not None and value != "":
+                return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _target_action_usd(action: Dict[str, Any]) -> float:
+    explicit = _target_action_float(
+        action,
+        "usd",
+        "usd_size",
+        "usdSize",
+        "usdc",
+        "usdc_size",
+        "usdcSize",
+        "amount_usd",
+        "amountUsd",
+        "value",
+    )
+    if explicit > 0:
+        return explicit
+    size = _target_action_float(action, "size", "amount", "quantity", "fillSize")
+    price = _target_action_float(action, "price", "fillPrice", "avgPrice")
+    return max(0.0, size * price)
+
+
+def _target_action_identity(action: Dict[str, Any], source: str, token_id: str) -> str:
+    raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+    for key in (
+        "transactionHash",
+        "transaction_hash",
+        "txHash",
+        "tx_hash",
+        "hash",
+        "id",
+        "tradeId",
+        "activityId",
+    ):
+        value = action.get(key)
+        if value is None and isinstance(raw, dict):
+            value = raw.get(key)
+        text = str(value or "").strip()
+        if text:
+            return f"{source.lower()}|{token_id}|{text}"
+    side = str(action.get("side") or "").upper()
+    ts_ms = _target_action_timestamp_ms(action)
+    size = _target_action_float(action, "size", "amount", "quantity", "fillSize")
+    price = _target_action_float(action, "price", "fillPrice", "avgPrice")
+    return f"{source.lower()}|{token_id}|{side}|{ts_ms}|{size:.8f}|{price:.8f}"
+
+
+def _target_scalper_guard_stats(
+    history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ordered = sorted(history, key=lambda item: int(item.get("ts_ms") or 0))
+    switches = 0
+    previous_side = ""
+    buy_count = 0
+    sell_count = 0
+    buy_usd = 0.0
+    sell_usd = 0.0
+    buy_price_weighted = 0.0
+    sell_price_weighted = 0.0
+    buy_size = 0.0
+    sell_size = 0.0
+    for item in ordered:
+        side = str(item.get("side") or "").upper()
+        if previous_side and side and side != previous_side:
+            switches += 1
+        if side:
+            previous_side = side
+        usd = float(item.get("usd") or 0.0)
+        size = float(item.get("size") or 0.0)
+        price = float(item.get("price") or 0.0)
+        if side == "BUY":
+            buy_count += 1
+            buy_usd += usd
+            if price > 0 and size > 0:
+                buy_price_weighted += price * size
+                buy_size += size
+        elif side == "SELL":
+            sell_count += 1
+            sell_usd += usd
+            if price > 0 and size > 0:
+                sell_price_weighted += price * size
+                sell_size += size
+    return {
+        "trades": len(ordered),
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "switches": switches,
+        "buy_usd": buy_usd,
+        "sell_usd": sell_usd,
+        "avg_buy_price": buy_price_weighted / buy_size if buy_size > 0 else 0.0,
+        "avg_sell_price": sell_price_weighted / sell_size if sell_size > 0 else 0.0,
+    }
+
+
+def _target_scalper_guard_triggered(stats: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[bool, str]:
+    min_trades = max(2, int(cfg.get("scalper_guard_min_trades") or 6))
+    min_switches = max(1, int(cfg.get("scalper_guard_min_side_switches") or 3))
+    min_side_count = max(1, int(cfg.get("scalper_guard_min_side_count") or 2))
+    min_each_side_usd = max(0.0, float(cfg.get("scalper_guard_min_each_side_usd") or 3.0))
+    require_price_edge = _cfg_bool(cfg.get("scalper_guard_require_price_edge"), False)
+    min_price_edge = max(0.0, float(cfg.get("scalper_guard_min_price_edge") or 0.003))
+
+    if int(stats.get("trades") or 0) < min_trades:
+        return False, "not_enough_trades"
+    if int(stats.get("switches") or 0) < min_switches:
+        return False, "not_enough_side_switches"
+    if int(stats.get("buy_count") or 0) < min_side_count or int(stats.get("sell_count") or 0) < min_side_count:
+        return False, "not_enough_each_side"
+    if float(stats.get("buy_usd") or 0.0) < min_each_side_usd:
+        return False, "buy_usd_too_small"
+    if float(stats.get("sell_usd") or 0.0) < min_each_side_usd:
+        return False, "sell_usd_too_small"
+    avg_buy = float(stats.get("avg_buy_price") or 0.0)
+    avg_sell = float(stats.get("avg_sell_price") or 0.0)
+    if require_price_edge and (avg_buy <= 0 or avg_sell < avg_buy + min_price_edge):
+        return False, "price_edge_not_confirmed"
+    return True, "short_window_buy_sell_churn"
+
+
+def _target_scalper_guard_should_block_buy(
+    action: Dict[str, Any],
+    cfg: Dict[str, Any] | None,
+    logger: logging.Logger,
+) -> bool:
+    if cfg is None or not _cfg_bool(cfg.get("scalper_guard_enabled"), False):
+        return False
+
+    side = str(action.get("side") or "").upper()
+    if side not in {"BUY", "SELL"}:
+        return False
+    source = str(action.get("_source_target") or "").strip().lower()
+    token_id = str(action.get("token_id") or "").strip()
+    if not source or not token_id:
+        return False
+
+    now_ms = int(time.time() * 1000)
+    ts_ms = _target_action_timestamp_ms(action) or now_ms
+    window_sec = max(60, int(cfg.get("scalper_guard_window_sec") or 900))
+    block_sec = max(60, int(cfg.get("scalper_guard_block_sec") or 7200))
+    key = f"{source}|{token_id}"
+    block_until = int(_SCALPER_GUARD_BLOCK_UNTIL_MS.get(key) or 0)
+    already_blocked = side == "BUY" and block_until > now_ms
+
+    history = list(_SCALPER_GUARD_HISTORY.get(key) or [])
+    identity = _target_action_identity(action, source, token_id)
+    if not any(item.get("id") == identity for item in history):
+        size = _target_action_float(action, "size", "amount", "quantity", "fillSize")
+        price = _target_action_float(action, "price", "fillPrice", "avgPrice")
+        history.append(
+            {
+                "id": identity,
+                "ts_ms": ts_ms,
+                "side": side,
+                "usd": _target_action_usd(action),
+                "size": max(0.0, size),
+                "price": max(0.0, price),
+            }
+        )
+    cutoff_ms = ts_ms - window_sec * 1000
+    history = [item for item in history if int(item.get("ts_ms") or 0) >= cutoff_ms]
+    if len(history) > 200:
+        history = sorted(history, key=lambda item: int(item.get("ts_ms") or 0))[-200:]
+    _SCALPER_GUARD_HISTORY[key] = history
+
+    stats = _target_scalper_guard_stats(history)
+    triggered, reason = _target_scalper_guard_triggered(stats, cfg)
+    if triggered:
+        new_block_until = max(block_until, now_ms + block_sec * 1000)
+        _SCALPER_GUARD_BLOCK_UNTIL_MS[key] = new_block_until
+        last_log = int(_SCALPER_GUARD_LAST_LOG_MS.get(key) or 0)
+        if now_ms - last_log >= 60_000:
+            _SCALPER_GUARD_LAST_LOG_MS[key] = now_ms
+            logger.warning(
+                "[SCALPER_GUARD] stop_follow_buy source=%s token=%s reason=%s "
+                "trades=%s buy=%s sell=%s switches=%s buy_usd=%.2f sell_usd=%.2f "
+                "avg_buy=%.4f avg_sell=%.4f block_sec=%s",
+                _shorten_address(source),
+                token_id[:10] + ".." + token_id[-6:] if len(token_id) > 18 else token_id,
+                reason,
+                int(stats.get("trades") or 0),
+                int(stats.get("buy_count") or 0),
+                int(stats.get("sell_count") or 0),
+                int(stats.get("switches") or 0),
+                float(stats.get("buy_usd") or 0.0),
+                float(stats.get("sell_usd") or 0.0),
+                float(stats.get("avg_buy_price") or 0.0),
+                float(stats.get("avg_sell_price") or 0.0),
+                block_sec,
+            )
+        return side == "BUY"
+
+    if already_blocked:
+        return True
+    return False
 
 
 def _cfg_bool(value: Any, default: bool = False) -> bool:
@@ -5440,6 +5707,7 @@ def main() -> None:
                     target_blacklists=target_blacklists,
                     target_buy_blocklists=target_buy_blocklists,
                     target_whitelists=target_whitelists,
+                    scalper_guard_cfg=cfg,
                 )
             except Exception as exc:
                 logger.warning("[SHARED_CACHE] fetch target actions failed: %s", exc)
