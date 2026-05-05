@@ -92,7 +92,8 @@
       ],
       "whitelist_topic_keys": [
         "sports",
-        "us-politics"
+        "us-politics",
+        "geopolitics"
       ]
     },
     {
@@ -204,8 +205,7 @@
         "news"
       ],
       "whitelist_topic_keys": [
-        "sports",
-        "us-politics"
+        "sports"
       ]
     },
     {
@@ -224,8 +224,7 @@
         "against"
       ],
       "whitelist_topic_keys": [
-        "sports",
-        "us-politics"
+        "sports"
       ]
     },
     {
@@ -301,7 +300,6 @@
         "mibr"
       ],
       "whitelist_topic_keys": [
-        "sports",
         "us-politics",
         "macro"
       ]
@@ -348,9 +346,7 @@
         "heat",
         "city"
       ],
-      "whitelist_topic_keys": [
-        "sports"
-      ]
+      "whitelist_topic_keys": []
     },
     {
       "address": "0x16bd7cc71f6da1e77d1d8255677abc75b9bae288",
@@ -635,9 +631,9 @@
         "new"
       ],
       "whitelist_topic_keys": [
-        "sports",
         "crypto",
-        "us-politics"
+        "us-politics",
+        "macro"
       ]
     },
     {
