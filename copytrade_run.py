@@ -429,6 +429,18 @@ def _resolve_target_level_skip_log_path(cfg: Dict[str, Any], base_dir: Path) -> 
     return log_dir / file_path
 
 
+def _resolve_token_source_vote_log_path(cfg: Dict[str, Any], base_dir: Path) -> Path:
+    log_dir_value = cfg.get("log_dir") or "logs"
+    log_dir = Path(log_dir_value)
+    if not log_dir.is_absolute():
+        log_dir = base_dir / log_dir
+    file_value = str(cfg.get("token_source_vote_log_file") or "token_source_vote_log.jsonl")
+    file_path = Path(file_value)
+    if file_path.is_absolute():
+        return file_path
+    return log_dir / file_path
+
+
 def _append_target_level_skip_log(
     log_path: Path,
     payload: Dict[str, Any],
@@ -440,6 +452,19 @@ def _append_target_level_skip_log(
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception as exc:
         logger.warning("[TARGET_LEVEL] skip log write failed path=%s err=%s", log_path, exc)
+
+
+def _append_token_source_vote_log(
+    log_path: Path,
+    payload: Dict[str, Any],
+    logger: logging.Logger,
+) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("[SOURCE] vote log write failed path=%s err=%s", log_path, exc)
 
 
 def _prune_target_level_decisions(
@@ -470,6 +495,7 @@ def _resolve_signal_source_target(
     buy_signal_source_by_token: Dict[str, str],
     position_source: Dict[str, str],
     target_addresses: List[str],
+    token_source_history: Dict[str, Any] | None = None,
 ) -> str:
     token = str(token_id or "")
     src = str(buy_signal_source_by_token.get(token) or "").strip().lower()
@@ -478,9 +504,107 @@ def _resolve_signal_source_target(
     src = str(position_source.get(token) or "").strip().lower()
     if src:
         return src
+    if isinstance(token_source_history, dict):
+        hist_item = token_source_history.get(token)
+        if isinstance(hist_item, dict):
+            src = str(hist_item.get("primary_source") or "").strip().lower()
+            if not src:
+                src = str(hist_item.get("last_source") or "").strip().lower()
+            if not src:
+                by_source = hist_item.get("by_source")
+                if isinstance(by_source, dict) and by_source:
+                    src = str(
+                        max(
+                            by_source.items(),
+                            key=lambda kv: int(kv[1] or 0),
+                        )[0]
+                    ).strip().lower()
+            if src:
+                return src
     if target_addresses:
         return str(target_addresses[0]).strip().lower()
     return ""
+
+
+def _remember_token_source_target(
+    state: Dict[str, Any],
+    token_id: str,
+    source_target: str,
+    now_ts: int,
+    hint: str = "",
+    log_path: Optional[Path] = None,
+    logger: Optional[logging.Logger] = None,
+    log_dedup_sec: int = 600,
+) -> None:
+    token = str(token_id or "").strip()
+    src = str(source_target or "").strip().lower()
+    if not token or not src:
+        return
+    history = state.setdefault("token_source_history", {})
+    if not isinstance(history, dict):
+        history = {}
+        state["token_source_history"] = history
+    entry = history.get(token)
+    if not isinstance(entry, dict):
+        entry = {}
+    by_source = entry.get("by_source")
+    if not isinstance(by_source, dict):
+        by_source = {}
+    by_source[src] = int(by_source.get(src) or 0) + 1
+    primary = str(entry.get("primary_source") or "").strip().lower()
+    if not primary:
+        primary = src
+    try:
+        voted_primary = max(
+            by_source.items(),
+            key=lambda kv: int(kv[1] or 0),
+        )[0]
+    except Exception:
+        voted_primary = primary
+    entry["by_source"] = by_source
+    entry["primary_source"] = str(voted_primary or primary).strip().lower()
+    entry["last_source"] = src
+    first_seen_ts = int(entry.get("first_seen_ts") or 0)
+    if first_seen_ts <= 0:
+        entry["first_seen_ts"] = int(now_ts)
+    entry["last_seen_ts"] = int(now_ts)
+    if hint:
+        entry["last_hint"] = str(hint)
+    history[token] = entry
+    if log_path is None or logger is None:
+        return
+
+    dedup_window = max(0, int(log_dedup_sec))
+    if dedup_window > 0:
+        dedup_map = state.setdefault("token_source_vote_log_dedup", {})
+        if not isinstance(dedup_map, dict):
+            dedup_map = {}
+            state["token_source_vote_log_dedup"] = dedup_map
+        dedup_key = f"{token}|{src}|{hint or '-'}"
+        last_ts = int(dedup_map.get(dedup_key) or 0)
+        if last_ts > 0 and int(now_ts) - last_ts < dedup_window:
+            return
+        dedup_map[dedup_key] = int(now_ts)
+        if len(dedup_map) > 5000:
+            # Keep dedup cache bounded; oldest timestamps are least useful.
+            for key, _val in sorted(
+                dedup_map.items(),
+                key=lambda kv: int(kv[1] or 0),
+            )[:1000]:
+                dedup_map.pop(key, None)
+
+    _append_token_source_vote_log(
+        log_path,
+        {
+            "ts": int(now_ts),
+            "token_id": token,
+            "source_target": src,
+            "hint": str(hint or ""),
+            "primary_source": str(entry.get("primary_source") or ""),
+            "source_votes": int((entry.get("by_source") or {}).get(src) or 0),
+        },
+        logger,
+    )
 
 
 def _pick_target_level_skipped_accounts(
@@ -784,6 +908,7 @@ def _fetch_all_target_positions(
     target_addresses: List[str],
     target_ratios: Dict[str, float],
     target_blacklists: Dict[str, List[str]],
+    target_topic_blacklists: Dict[str, Set[str]],
     size_threshold: float,
     positions_limit: int,
     positions_max_pages: int,
@@ -831,6 +956,24 @@ def _fetch_all_target_positions(
             # Merge positions - take maximum for each token (apply per-target ratio)
             ratio = target_ratios.get(target_addr.lower(), 1.0)
             blacklist = _normalize_token_blacklist(target_blacklists.get(target_addr.lower(), []))
+            topic_blacklist = set(target_topic_blacklists.get(target_addr.lower(), set()))
+            topic_meta_by_token: Dict[str, Dict[str, Any]] = {}
+            if topic_blacklist:
+                token_ids: List[str] = []
+                condition_ids_by_token: Dict[str, str] = {}
+                for pos in positions:
+                    token_id = str(pos.get("token_id") or pos.get("raw", {}).get("asset") or "").strip()
+                    condition_id = str(pos.get("condition_id") or "").strip()
+                    if token_id:
+                        token_ids.append(token_id)
+                        if condition_id:
+                            condition_ids_by_token[token_id] = condition_id
+                if token_ids:
+                    topic_meta_by_token = gamma_fetch_topic_metadata_by_token_ids(
+                        token_ids,
+                        condition_ids_by_token=condition_ids_by_token,
+                    )
+            skipped_topic_blacklist = 0
             for pos in positions:
                 token_key = str(pos.get("token_key") or "")
                 if not token_key:
@@ -840,6 +983,13 @@ def _fetch_all_target_positions(
                 if blacklist:
                     title_l = str(pos.get("title") or "").lower()
                     if any(str(bl_item).lower() in title_l for bl_item in blacklist if bl_item is not None):
+                        continue
+
+                if topic_blacklist:
+                    token_id = str(pos.get("token_id") or pos.get("raw", {}).get("asset") or "").strip()
+                    topic_meta = topic_meta_by_token.get(token_id) if token_id else None
+                    if _topic_matches_filter(topic_blacklist, topic_meta):
+                        skipped_topic_blacklist += 1
                         continue
 
                 size = float(pos.get("size") or 0.0) * ratio
@@ -855,6 +1005,13 @@ def _fetch_all_target_positions(
                     all_positions_by_token[token_key] = pos_copy
                     if token_id:
                         position_source[str(token_id)] = target_addr
+
+            if skipped_topic_blacklist:
+                logger.debug(
+                    "[MULTI-TARGET] Skipped %d topic-blacklisted positions from target=%s",
+                    skipped_topic_blacklist,
+                    _shorten_address(target_addr),
+                )
 
             logger.debug(
                 "[MULTI-TARGET] Fetched %d positions from target=%s",
@@ -899,6 +1056,9 @@ def _fetch_all_target_actions(
     target_blacklists: Dict[str, List[str]] | None = None,
     target_buy_blocklists: Dict[str, List[str]] | None = None,
     target_whitelists: Dict[str, List[str]] | None = None,
+    target_topic_blacklists: Dict[str, Set[str]] | None = None,
+    target_buy_block_topic_blacklists: Dict[str, Set[str]] | None = None,
+    enable_target_whitelist: bool = False,
     scalper_guard_cfg: Dict[str, Any] | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
@@ -947,10 +1107,18 @@ def _fetch_all_target_actions(
             if target_latest_ms > max_latest_ms:
                 max_latest_ms = target_latest_ms
 
-            whitelist_enabled = target_whitelists is not None and target_addr.lower() in target_whitelists
+            whitelist_enabled = (
+                bool(enable_target_whitelist)
+                and target_whitelists is not None
+                and target_addr.lower() in target_whitelists
+            )
             whitelist = _normalize_whitelist((target_whitelists or {}).get(target_addr.lower()))
+            topic_blacklist = set((target_topic_blacklists or {}).get(target_addr.lower(), set()))
+            buy_block_topic_blacklist = set(
+                (target_buy_block_topic_blacklists or {}).get(target_addr.lower(), set())
+            )
             topic_meta_by_token: Dict[str, Dict[str, Any]] = {}
-            if whitelist_enabled:
+            if whitelist_enabled or topic_blacklist or buy_block_topic_blacklist:
                 buy_token_ids: List[str] = []
                 condition_ids_by_token: Dict[str, str] = {}
                 for action in actions:
@@ -980,6 +1148,8 @@ def _fetch_all_target_actions(
             skipped_blacklist = 0
             skipped_buy_blocklist = 0
             skipped_whitelist = 0
+            skipped_topic_blacklist = 0
+            skipped_buy_block_topic_blacklist = 0
             skipped_scalper_guard = 0
             for action in sorted(actions, key=_target_action_timestamp_ms):
                 action_copy = dict(action)
@@ -1007,6 +1177,16 @@ def _fetch_all_target_actions(
                     if any(str(bl_item).lower() in title_l for bl_item in buy_blocklist if bl_item is not None):
                         skipped_buy_blocklist += 1
                         continue
+                if topic_blacklist and side == "BUY" and _topic_matches_filter(topic_blacklist, topic_meta):
+                    skipped_topic_blacklist += 1
+                    continue
+                if (
+                    buy_block_topic_blacklist
+                    and side == "BUY"
+                    and _topic_matches_filter(buy_block_topic_blacklist, topic_meta)
+                ):
+                    skipped_buy_block_topic_blacklist += 1
+                    continue
                 if whitelist_enabled and side == "BUY" and not _topic_matches_whitelist(whitelist, topic_meta):
                     skipped_whitelist += 1
                     continue
@@ -1034,6 +1214,18 @@ def _fetch_all_target_actions(
                 logger.debug(
                     "[MULTI-TARGET] Skipped %d non-whitelisted BUY actions from target=%s",
                     skipped_whitelist,
+                    _shorten_address(target_addr),
+                )
+            if skipped_topic_blacklist:
+                logger.debug(
+                    "[MULTI-TARGET] Skipped %d topic-blacklisted BUY actions from target=%s",
+                    skipped_topic_blacklist,
+                    _shorten_address(target_addr),
+                )
+            if skipped_buy_block_topic_blacklist:
+                logger.debug(
+                    "[MULTI-TARGET] Skipped %d BUY-only topic-blocked actions from target=%s",
+                    skipped_buy_block_topic_blacklist,
                     _shorten_address(target_addr),
                 )
             if skipped_scalper_guard:
@@ -1114,15 +1306,23 @@ def _normalize_whitelist(values: List[str] | None) -> Set[str]:
     return normalized
 
 
-def _attach_topic_metadata(action: Dict[str, Any], topic_meta: Dict[str, Any]) -> None:
-    topic_keys = topic_meta.get("topic_keys") or []
-    if isinstance(topic_keys, list):
-        action["topic_keys"] = list(topic_keys)
-    action["_topic_meta"] = dict(topic_meta)
+def _normalize_topic_blacklist(values: Any) -> Set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+    normalized: Set[str] = set()
+    for value in values:
+        key = _normalize_topic_key(value)
+        if key:
+            normalized.add(key)
+    return normalized
 
 
-def _topic_matches_whitelist(whitelist: Set[str], topic_meta: Dict[str, Any] | None) -> bool:
-    if not whitelist:
+def _topic_matches_filter(topic_filter: Set[str], topic_meta: Dict[str, Any] | None) -> bool:
+    if not topic_filter:
         return False
     if not isinstance(topic_meta, dict):
         return False
@@ -1133,7 +1333,20 @@ def _topic_matches_whitelist(whitelist: Set[str], topic_meta: Dict[str, Any] | N
         for normalized in [_normalize_topic_key(value)]
         if normalized
     }
-    return bool(normalized_keys & whitelist)
+    return bool(normalized_keys & topic_filter)
+
+
+def _attach_topic_metadata(action: Dict[str, Any], topic_meta: Dict[str, Any]) -> None:
+    topic_keys = topic_meta.get("topic_keys") or []
+    if isinstance(topic_keys, list):
+        action["topic_keys"] = list(topic_keys)
+    action["_topic_meta"] = dict(topic_meta)
+
+
+def _topic_matches_whitelist(whitelist: Set[str], topic_meta: Dict[str, Any] | None) -> bool:
+    if not whitelist:
+        return False
+    return _topic_matches_filter(whitelist, topic_meta)
 
 
 _SCALPER_GUARD_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
@@ -4696,6 +4909,7 @@ def _init_account_contexts(
             state["target_missing_streak"] = {}
             state["last_target_sell_action_ts_by_token"] = {}
             state["topic_state"] = {}
+            state["token_source_history"] = {}
             state["open_orders"] = {}
             state["open_orders_all"] = []
             state["must_exit_tokens"] = {}
@@ -4724,6 +4938,7 @@ def _init_account_contexts(
         state.setdefault("last_target_sell_action_ts_by_token", {})
         state.setdefault("cooldown_until", {})
         state.setdefault("topic_state", {})
+        state.setdefault("token_source_history", {})
         state.setdefault("target_actions_cursor_ms", 0)
         state.setdefault("ignored_tokens", {})
         state.setdefault("topic_unfilled_attempts", {})
@@ -4908,10 +5123,15 @@ def main() -> None:
     target_ratios: Dict[str, float] = {}
     target_blacklists: Dict[str, List[str]] = {}
     target_buy_blocklists: Dict[str, List[str]] = {}
+    target_topic_blacklists: Dict[str, Set[str]] = {}
+    target_buy_block_topic_blacklists: Dict[str, Set[str]] = {}
     target_whitelists: Dict[str, List[str]] = {}
+    enable_target_whitelist = _cfg_bool(cfg.get("enable_target_whitelist"), False)
     whitelist_missing = object()
     global_whitelist = cfg.get("whitelist_topic_keys", whitelist_missing)
     global_buy_blocklist = cfg.get("buy_block_token_keys")
+    global_topic_blacklist = cfg.get("blacklist_topic_keys")
+    global_buy_block_topic_blacklist = cfg.get("buy_block_topic_keys")
     target_list = cfg.get("target_addresses")
     if isinstance(target_list, list) and target_list:
         for item in target_list:
@@ -4926,7 +5146,13 @@ def main() -> None:
                     target_buy_blocklists[addr_str.lower()] = _normalize_token_blacklist(
                         global_buy_blocklist
                     )
-                    if isinstance(global_whitelist, list):
+                    target_topic_blacklists[addr_str.lower()] = _normalize_topic_blacklist(
+                        global_topic_blacklist
+                    )
+                    target_buy_block_topic_blacklists[addr_str.lower()] = _normalize_topic_blacklist(
+                        global_buy_block_topic_blacklist
+                    )
+                    if enable_target_whitelist and isinstance(global_whitelist, list):
                         target_whitelists[addr_str.lower()] = global_whitelist
                 else:
                     pass  # silently skip invalid address before logger init
@@ -4953,12 +5179,30 @@ def main() -> None:
                         target_buy_blocklists[addr_str.lower()] = _normalize_token_blacklist(
                             global_buy_blocklist
                         )
-                    if "whitelist_topic_keys" in item:
+                    per_target_topic_bl = item.get("blacklist_topic_keys")
+                    if per_target_topic_bl is not None:
+                        target_topic_blacklists[addr_str.lower()] = _normalize_topic_blacklist(
+                            per_target_topic_bl
+                        )
+                    else:
+                        target_topic_blacklists[addr_str.lower()] = _normalize_topic_blacklist(
+                            global_topic_blacklist
+                        )
+                    per_target_buy_topic_bl = item.get("buy_block_topic_keys")
+                    if per_target_buy_topic_bl is not None:
+                        target_buy_block_topic_blacklists[addr_str.lower()] = _normalize_topic_blacklist(
+                            per_target_buy_topic_bl
+                        )
+                    else:
+                        target_buy_block_topic_blacklists[addr_str.lower()] = _normalize_topic_blacklist(
+                            global_buy_block_topic_blacklist
+                        )
+                    if enable_target_whitelist and "whitelist_topic_keys" in item:
                         per_target_wl = item.get("whitelist_topic_keys")
                         target_whitelists[addr_str.lower()] = (
                             per_target_wl if isinstance(per_target_wl, list) else []
                         )
-                    elif isinstance(global_whitelist, list):
+                    elif enable_target_whitelist and isinstance(global_whitelist, list):
                         target_whitelists[addr_str.lower()] = global_whitelist
                 else:
                     pass  # silently skip invalid address before logger init
@@ -4985,7 +5229,13 @@ def main() -> None:
             target_buy_blocklists[
                 str(single_target).strip().lower()
             ] = _normalize_token_blacklist(global_buy_blocklist)
-            if isinstance(global_whitelist, list):
+            target_topic_blacklists[
+                str(single_target).strip().lower()
+            ] = _normalize_topic_blacklist(global_topic_blacklist)
+            target_buy_block_topic_blacklists[
+                str(single_target).strip().lower()
+            ] = _normalize_topic_blacklist(global_buy_block_topic_blacklist)
+            if enable_target_whitelist and isinstance(global_whitelist, list):
                 target_whitelists[str(single_target).strip().lower()] = global_whitelist
 
     if not target_addresses:
@@ -5002,6 +5252,7 @@ def main() -> None:
     # Setup logging using first target address
     logger = _setup_logging(cfg, cfg["target_address"], base_dir)
     target_level_skip_log_path = _resolve_target_level_skip_log_path(cfg, base_dir)
+    token_source_vote_log_path = _resolve_token_source_vote_log_path(cfg, base_dir)
 
     # Optional process-level worker supervisor: spawn N worker subprocesses,
     # each handling a disjoint account shard.
@@ -5025,6 +5276,12 @@ def main() -> None:
         "[MULTI-TARGET] Resolved %d target address(es): %s",
         len(target_addresses),
         ", ".join(_shorten_address(a) for a in target_addresses),
+    )
+    logger.info(
+        "[TARGET_FILTER] whitelist_enabled=%s topic_blacklist_targets=%s buy_block_topic_targets=%s",
+        bool(enable_target_whitelist),
+        sum(1 for v in target_topic_blacklists.values() if v),
+        sum(1 for v in target_buy_block_topic_blacklists.values() if v),
     )
     logger.info(
         "[TARGET_LEVEL] policy skip_ratios=%s levels=%s",
@@ -5136,6 +5393,7 @@ def main() -> None:
         state["target_missing_streak"] = {}
         state["last_target_sell_action_ts_by_token"] = {}
         state["topic_state"] = {}
+        state["token_source_history"] = {}
         state["open_orders"] = {}
         state["open_orders_all"] = []
         state["must_exit_tokens"] = {}
@@ -5264,6 +5522,8 @@ def main() -> None:
         state["target_last_event_ts"] = {}
     if not isinstance(state.get("topic_state"), dict):
         state["topic_state"] = {}
+    if not isinstance(state.get("token_source_history"), dict):
+        state["token_source_history"] = {}
     if not isinstance(state.get("target_actions_cursor_ms"), (int, float)):
         state["target_actions_cursor_ms"] = 0
     if not isinstance(state.get("last_mid_price_by_token_id"), dict):
@@ -5403,6 +5663,7 @@ def main() -> None:
         nonlocal cfg, root_cfg, last_config_reload_ts, last_config_mtime
         nonlocal target_levels, target_level_skip_ratios
         nonlocal target_level_skip_log_path
+        nonlocal token_source_vote_log_path
         nonlocal target_level_seed
         try:
             new_cfg = normalize_risk_config(_load_config(Path(args.config)))
@@ -5436,6 +5697,7 @@ def main() -> None:
         target_levels = _resolve_target_level_map(cfg, target_addresses)
         target_level_skip_ratios = _resolve_target_level_skip_ratios(cfg)
         target_level_skip_log_path = _resolve_target_level_skip_log_path(cfg, base_dir)
+        token_source_vote_log_path = _resolve_token_source_vote_log_path(cfg, base_dir)
         target_level_seed = _resolve_target_level_seed(cfg)
         state["follow_ratio"] = cfg.get("follow_ratio")
         _apply_cfg_settings()
@@ -5651,6 +5913,19 @@ def main() -> None:
                     for k, v in target_whitelists.items()
                 )
             ),
+            tuple(
+                sorted(
+                    (k, tuple(sorted(v)))
+                    for k, v in target_topic_blacklists.items()
+                )
+            ),
+            tuple(
+                sorted(
+                    (k, tuple(sorted(v)))
+                    for k, v in target_buy_block_topic_blacklists.items()
+                )
+            ),
+            bool(enable_target_whitelist),
             positions_limit,
             positions_max_pages,
             round(size_threshold, 9),
@@ -5671,6 +5946,7 @@ def main() -> None:
                     target_addresses,
                     target_ratios,
                     target_blacklists,
+                    target_topic_blacklists,
                     size_threshold,
                     positions_limit=positions_limit,
                     positions_max_pages=positions_max_pages,
@@ -5707,6 +5983,9 @@ def main() -> None:
                     target_blacklists=target_blacklists,
                     target_buy_blocklists=target_buy_blocklists,
                     target_whitelists=target_whitelists,
+                    target_topic_blacklists=target_topic_blacklists,
+                    target_buy_block_topic_blacklists=target_buy_block_topic_blacklists,
+                    enable_target_whitelist=enable_target_whitelist,
                     scalper_guard_cfg=cfg,
                 )
             except Exception as exc:
@@ -5982,6 +6261,9 @@ def main() -> None:
             0.0, float(cfg.get("must_exit_clear_on_buy_min_target_shares") or 1.0)
         )
         buy_actions_source_mode = str(cfg.get("buy_actions_source_mode") or "all").strip().lower()
+        token_source_vote_log_dedup_sec = max(
+            0, int(cfg.get("token_source_vote_log_dedup_sec") or 600)
+        )
         lag_ms = 0
         now_ms = int(now_ts * 1000)
         replay_from_ms = int(state.get("actions_replay_from_ms") or 0)
@@ -6002,6 +6284,21 @@ def main() -> None:
         )
         last_exit_ts_by_token = state.setdefault("last_exit_ts_by_token", {})
         position_source = dict(cached_position_source)
+        token_source_history = state.setdefault("token_source_history", {})
+        if not isinstance(token_source_history, dict):
+            token_source_history = {}
+            state["token_source_history"] = token_source_history
+        for _tid, _src in position_source.items():
+            _remember_token_source_target(
+                state,
+                str(_tid),
+                str(_src),
+                now_ts,
+                hint="target_position_snapshot",
+                log_path=token_source_vote_log_path,
+                logger=logger,
+                log_dedup_sec=token_source_vote_log_dedup_sec,
+            )
         buy_source_filtered = 0
 
         def _record_action(
@@ -6017,6 +6314,16 @@ def main() -> None:
             if side == "BUY":
                 has_buy_by_token[token_id] = True
                 buy_sum_by_token[token_id] = buy_sum_by_token.get(token_id, 0.0) + size
+                _remember_token_source_target(
+                    state,
+                    token_id,
+                    source_target,
+                    now_ts,
+                    hint="target_action_buy",
+                    log_path=token_source_vote_log_path,
+                    logger=logger,
+                    log_dedup_sec=token_source_vote_log_dedup_sec,
+                )
                 if price > 0:
                     prev_ms = int(buy_signal_ms_by_token.get(token_id) or 0)
                     if action_ms >= prev_ms:
@@ -6024,6 +6331,16 @@ def main() -> None:
             elif side == "SELL":
                 has_sell_by_token[token_id] = True
                 sell_sum_by_token[token_id] = sell_sum_by_token.get(token_id, 0.0) + size
+                _remember_token_source_target(
+                    state,
+                    token_id,
+                    source_target,
+                    now_ts,
+                    hint="target_action_sell",
+                    log_path=token_source_vote_log_path,
+                    logger=logger,
+                    log_dedup_sec=token_source_vote_log_dedup_sec,
+                )
                 sell_signal_count_by_token[token_id] = int(
                     sell_signal_count_by_token.get(token_id) or 0
                 ) + 1
@@ -7354,6 +7671,27 @@ def main() -> None:
         topic_unfilled = state.setdefault("topic_unfilled_attempts", {})
         quarantine_sec = int(cfg.get("cleanup_quarantine_sec") or 300)
         if isinstance(topic_state, dict):
+            # Seed source history once from persisted topic_state so ignored/stale
+            # topics still keep attribution breadcrumbs.
+            for _seed_tid, _seed_st in topic_state.items():
+                if str(_seed_tid) in token_source_history:
+                    continue
+                seed_source = ""
+                if isinstance(_seed_st, dict):
+                    seed_source = str(_seed_st.get("primary_entry_source") or "").strip().lower()
+                if not seed_source:
+                    continue
+                _remember_token_source_target(
+                    state,
+                    str(_seed_tid),
+                    seed_source,
+                    now_ts,
+                    hint="topic_seed_init",
+                    log_path=token_source_vote_log_path,
+                    logger=logger,
+                    log_dedup_sec=token_source_vote_log_dedup_sec,
+                )
+
             for tid in list(topic_state.keys()):
                 my_shares_t = my_by_token_id.get(tid, 0.0)
                 orders_t = state.get("open_orders", {}).get(tid, [])
@@ -7406,6 +7744,18 @@ def main() -> None:
                                 tid,
                             )
                             continue
+                        cleanup_source = str(st_t.get("primary_entry_source") or "").strip().lower()
+                        if cleanup_source:
+                            _remember_token_source_target(
+                                state,
+                                tid,
+                                cleanup_source,
+                                now_ts,
+                                hint="topic_cleanup_confirmed",
+                                log_path=token_source_vote_log_path,
+                                logger=logger,
+                                log_dedup_sec=token_source_vote_log_dedup_sec,
+                            )
                         topic_state.pop(tid, None)
                         state.setdefault("sell_shares_accumulator", {}).pop(tid, None)
                         logger.info(
@@ -7434,6 +7784,18 @@ def main() -> None:
                         st_t["cleanup_ts"] = st_t.get("cleanup_ts") or now_ts
                         st_t["desired_shares"] = 0.0
                         st_t["desired_side"] = "SELL"
+                        cleanup_source = str(st_t.get("primary_entry_source") or "").strip().lower()
+                        if cleanup_source:
+                            _remember_token_source_target(
+                                state,
+                                tid,
+                                cleanup_source,
+                                now_ts,
+                                hint="topic_cleanup_suspect",
+                                log_path=token_source_vote_log_path,
+                                logger=logger,
+                                log_dedup_sec=token_source_vote_log_dedup_sec,
+                            )
                         topic_state[tid] = st_t
                         logger.info(
                             "[TOPIC] CLEANUP_SUSPICIOUS token_id=%s quarantine_until=%s",
@@ -7741,6 +8103,7 @@ def main() -> None:
                 buy_signal_source_by_token=buy_signal_source_by_token,
                 position_source=position_source,
                 target_addresses=target_addresses,
+                token_source_history=token_source_history,
             )
             signal_target_level = target_levels.get(signal_source_target, "A")
             signal_skip_ratio = float(target_level_skip_ratios.get(signal_target_level, 0.0))
@@ -7822,6 +8185,17 @@ def main() -> None:
             if has_buy and primary_entry_source and not str(st.get("primary_entry_source") or "").strip():
                 st["primary_entry_source"] = primary_entry_source
                 topic_state[token_id] = st
+            if primary_entry_source:
+                _remember_token_source_target(
+                    state,
+                    token_id,
+                    primary_entry_source,
+                    now_ts,
+                    hint="topic_primary_entry",
+                    log_path=token_source_vote_log_path,
+                    logger=logger,
+                    log_dedup_sec=token_source_vote_log_dedup_sec,
+                )
             sell_signal_allowed = True
             sell_signal_reason = "no_sell_action"
             sell_signal_sellers: List[str] = []
