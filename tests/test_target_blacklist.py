@@ -2,6 +2,8 @@
 import sys
 import logging
 
+import copytrade_run
+import ct_data
 from copytrade_run import _fetch_all_target_actions, _normalize_token_blacklist
 
 logger = logging.getLogger("test_target_blacklist")
@@ -150,6 +152,61 @@ def test_buy_only_blocklist_blocks_buy_and_keeps_sell(monkeypatch):
     assert info["ok"] is True
     assert [item["side"] for item in merged] == ["SELL"]
     print("[PASS] buy_only_blocklist_blocks_buy_and_keeps_sell")
+
+
+def test_topic_blacklist_filters_target_positions(monkeypatch):
+    def fake_fetch_positions_norm(*_args, **_kwargs):
+        positions = [
+            {
+                "token_key": "tk_sports",
+                "token_id": "tok_sports",
+                "condition_id": "cond_sports",
+                "title": "Lakers vs Thunder",
+                "size": 10.0,
+                "raw": {"asset": "tok_sports"},
+            },
+            {
+                "token_key": "tk_macro",
+                "token_id": "tok_macro",
+                "condition_id": "cond_macro",
+                "title": "Will WTI hit $110",
+                "size": 5.0,
+                "raw": {"asset": "tok_macro"},
+            },
+        ]
+        return positions, {"ok": True, "incomplete": False}
+
+    def fake_gamma_fetch_topic_metadata_by_token_ids(token_ids, condition_ids_by_token=None):
+        return {
+            "tok_sports": {"topic_keys": ["sports", "nba"]},
+            "tok_macro": {"topic_keys": ["macro", "commodities"]},
+        }
+
+    monkeypatch.setattr(ct_data, "fetch_positions_norm", fake_fetch_positions_norm)
+    monkeypatch.setattr(
+        copytrade_run,
+        "gamma_fetch_topic_metadata_by_token_ids",
+        fake_gamma_fetch_topic_metadata_by_token_ids,
+    )
+
+    merged, info, _src = copytrade_run._fetch_all_target_positions(
+        data_client=object(),
+        target_addresses=["0xabc"],
+        target_ratios={"0xabc": 1.0},
+        target_blacklists={"0xabc": []},
+        target_topic_blacklists={"0xabc": {"sports"}},
+        size_threshold=0.0,
+        positions_limit=200,
+        positions_max_pages=5,
+        refresh_sec=5,
+        cache_bust_mode="none",
+        header_keys=[],
+        logger=logging.getLogger("test_topic_blacklist_filters_target_positions"),
+    )
+
+    assert info["ok"] is True
+    keys = {p["token_key"] for p in merged}
+    assert keys == {"tk_macro"}, keys
 
 
 if __name__ == "__main__":

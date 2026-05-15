@@ -33,7 +33,7 @@ if (-not $Nodes) {
 
 if (-not $BackupNodes) {
     $hkPrefix = ([string][char]0x9999) + ([string][char]0x6E2F)
-    $sharedBackups = (@(6, 7, 8, 9, 10, 11) | ForEach-Object { "{0}A{1:D2}" -f $hkPrefix, $_ }) -join "+"
+    $sharedBackups = (@(1, 6, 7, 8, 9, 10) | ForEach-Object { "{0}A{1:D2}" -f $hkPrefix, $_ }) -join "+"
     $BackupNodes = (@(1..5) | ForEach-Object { $sharedBackups }) -join ";"
 }
 

@@ -11,14 +11,22 @@
       "ratio": 0.6,
       "level": "B",
       "blacklist_token_keys": [
-        "forces enter",
-        "us forces enter",
         "ceasefire"
       ],
       "whitelist_topic_keys": [
         "geopolitics",
         "us-politics",
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "russia-x-ukraine-ceasefire",
+        "ukraine-peace-deal",
+        "trump-zelensky",
+        "trump-zelenskyy",
+        "foreign-policy",
+        "economy",
+        "oil",
+        "nuclear"
       ]
     },
     {
@@ -29,6 +37,13 @@
         "geopolitics",
         "sports",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "soccer",
+        "ucl",
+        "champions-league",
+        "games",
+        "moneyline"
       ]
     },
     {
@@ -36,9 +51,6 @@
       "ratio": 0.53,
       "level": "B",
       "blacklist_token_keys": [
-        "forces enter",
-        "us forces enter",
-        "ceasefire",
         "supreme leader",
         "public appearance",
         "P2P sale",
@@ -49,6 +61,15 @@
         "geopolitics",
         "us-politics",
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "diplomacy-ceasefire",
+        "iran-ceasefire",
+        "trump-iran",
+        "u-s-x-iran",
+        "10-point",
+        "agreement",
+        "ceasefire"
       ]
     },
     {
@@ -57,12 +78,8 @@
       "level": "B",
       "blacklist_token_keys": [
         "conflict ends",
-        "us forces enter",
-        "forces enter",
         "meeting",
         "re-enter",
-        "counter-strike",
-        "blast",
         "map winner",
         "map handicap",
         "bo3",
@@ -94,6 +111,12 @@
         "sports",
         "us-politics",
         "geopolitics"
+      ],
+      "buy_block_topic_keys": [
+        "putin",
+        "russia-x-ukraine-ceasefire",
+        "trump-zelenskyy",
+        "ukraine-peace-deal"
       ]
     },
     {
@@ -116,9 +139,7 @@
         "supreme leader",
         "which countries",
         "another country strike",
-        "meeting",
-        "forces enter",
-        "us forces enter"
+        "meeting"
       ],
       "buy_block_token_keys": [
         "russia x ukraine ceasefire",
@@ -129,6 +150,15 @@
         "geopolitics",
         "us-politics",
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "macro",
+        "economy",
+        "strait-of-hormuz",
+        "us-x-iran-diplomatic-meeting",
+        "diplomacy-ceasefire",
+        "iran-ceasefire",
+        "trump-iran"
       ]
     },
     {
@@ -136,76 +166,74 @@
       "ratio": 0.32,
       "level": "B",
       "blacklist_token_keys": [
-        "win on",
-        "draw",
-        "both teams to score",
-        "match winner",
-        "moneyline",
-        "1x2",
-        "League",
-        "Cup",
-        "Serie A",
-        "Championship"
+        "win on 20",
+        "end in a draw"
       ],
-      "whitelist_topic_keys": []
+      "whitelist_topic_keys": [],
+      "buy_block_topic_keys": [
+        "fa-cup",
+        "uel",
+        "uel-2025",
+        "la-liga",
+        "la-liga-2025",
+        "europa-conference-league"
+      ]
     },
     {
       "address": "0x1aeebd7b0eb92037a630004f8eabc0759c36c139",
       "ratio": 0.42,
       "level": "B",
       "blacklist_token_keys": [
-        "winner",
-        "championship",
         "top 4",
         "quarter-finals",
-        "relegated",
-        "sports winner",
         "entertainment winner"
       ],
-      "whitelist_topic_keys": []
+      "whitelist_topic_keys": [],
+      "buy_block_topic_keys": [
+        "f1",
+        "formula1",
+        "formula-1",
+        "grand-prix",
+        "ucl",
+        "champions-league",
+        "pga-tour",
+        "augusta",
+        "invitational",
+        "golf",
+        "the-masters"
+      ]
     },
     {
       "address": "0x712433f69c169ebaaa67ce13f3f66f54575e70c1",
       "ratio": 0.67,
       "level": "C",
       "blacklist_token_keys": [
-        "end",
-        "march",
-        "iran",
-        "oil",
-        "crude",
-        "hit",
-        "high",
-        "ceasefire",
-        "april",
-        "trump",
         "announces",
         "military"
       ],
       "whitelist_topic_keys": [
         "macro",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "us-x-iran-diplomatic-meeting",
+        "us-iran",
+        "middle-east"
       ]
     },
     {
       "address": "0x993f451b6d5c21996b1bf688493cea9c4c823ee3",
-      "ratio": 0.66,
-      "level": "A",
-      "blacklist_token_keys": [
-        "iran",
-        "forces",
-        "enter",
-        "march",
-        "trump",
-        "monday",
-        "china",
-        "conference",
-        "say",
-        "during",
-        "news"
-      ],
+      "ratio": 0.5,
+      "level": "B",
       "whitelist_topic_keys": [
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "crypto",
+        "pre-market",
+        "fdv",
+        "usd-ai",
+        "usdptai"
       ]
     },
     {
@@ -213,18 +241,23 @@
       "ratio": 0.62,
       "level": "C",
       "blacklist_token_keys": [
-        "iran",
-        "april",
-        "ceasefire",
-        "announces",
-        "trump",
         "operations",
-        "military",
-        "end",
-        "against"
+        "military"
       ],
       "whitelist_topic_keys": [
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "trump-iran",
+        "u-s-x-iran",
+        "us-politics",
+        "iran",
+        "geopolitics",
+        "politics",
+        "trump",
+        "china",
+        "hormuz",
+        "oil"
       ]
     },
     {
@@ -232,14 +265,20 @@
       "ratio": 0.71,
       "level": "A",
       "blacklist_token_keys": [
-        "win",
-        "real",
         "balompi",
-        "betis",
-        "manchester"
+        "betis"
       ],
       "whitelist_topic_keys": [
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "ucl",
+        "ucl-2025",
+        "ligue-1",
+        "ligue-1-2025",
+        "basketball",
+        "nba",
+        "nba-2026"
       ]
     },
     {
@@ -247,26 +286,25 @@
       "ratio": 0.56,
       "level": "B",
       "blacklist_token_keys": [
-        "iran",
-        "end",
-        "hit",
-        "oil",
-        "high",
-        "crude",
-        "march",
-        "december",
-        "april",
-        "ceasefire",
-        "trump",
-        "forces",
-        "israel",
-        "deal",
-        "new",
+        "hormuz",
+        "strait",
         "nato"
       ],
       "whitelist_topic_keys": [
         "macro",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "hormoz",
+        "hormuz",
+        "strait-of-hormuz",
+        "ships-transit-the-strait-of-hormuz-on-any-day",
+        "u-s-x-iran",
+        "trump-iran",
+        "oil",
+        "macro",
+        "economy",
+        "politics"
       ]
     },
     {
@@ -274,34 +312,18 @@
       "ratio": 0.5,
       "level": "B",
       "blacklist_token_keys": [
-        "playoffs",
-        "counter-strike",
-        "bo5",
-        "vincere",
-        "natus",
-        "blast",
-        "vitality",
         "rotterdam",
-        "open",
-        "esports",
-        "fut",
-        "pgl",
-        "next",
         "orb",
         "viktor",
-        "prime",
-        "minister",
-        "hungary",
-        "aurora",
-        "gaming",
-        "themongolz",
-        "bo3",
-        "astralis",
-        "mibr"
+        "prime minister",
+        "hungary"
       ],
       "whitelist_topic_keys": [
         "us-politics",
         "macro"
+      ],
+      "buy_block_topic_keys": [
+        "counter-strike-2"
       ]
     },
     {
@@ -309,16 +331,7 @@
       "ratio": 0.52,
       "level": "B",
       "blacklist_token_keys": [
-        "april",
-        "iran",
-        "ceasefire",
-        "march",
-        "military",
-        "announces",
-        "support",
-        "israel",
         "opposition",
-        "meeting",
         "hormuz",
         "strait",
         "lebanon"
@@ -326,54 +339,64 @@
       "whitelist_topic_keys": [
         "geopolitics",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "epstein",
+        "macro-geopolitics",
+        "ships",
+        "transit",
+        "china",
+        "diplomatic-meeting",
+        "kushner",
+        "rubio",
+        "witkoff"
       ]
     },
     {
       "address": "0xd2678dc3b152a54900f28b0e849afe2049df9dc6",
-      "ratio": 0.62,
-      "level": "B",
+      "ratio": 0.22,
+      "level": "C",
       "blacklist_token_keys": [
-        "win",
-        "arsenal",
-        "united",
-        "bayern",
-        "nchen",
-        "newcastle",
-        "pelicans",
-        "clippers",
-        "manchester",
-        "olympique",
-        "heat",
-        "city"
+        "rihanna album",
+        "win on 20"
       ],
-      "whitelist_topic_keys": []
+      "whitelist_topic_keys": [],
+      "buy_block_topic_keys": [
+        "sports",
+        "soccer",
+        "football",
+        "epl",
+        "premier-league",
+        "laliga",
+        "serie-a",
+        "bundesliga",
+        "ligue-1",
+        "champions-league",
+        "ucl",
+        "moneyline"
+      ]
     },
     {
       "address": "0x16bd7cc71f6da1e77d1d8255677abc75b9bae288",
       "ratio": 0.47,
       "level": "B",
       "blacklist_token_keys": [
-        "april",
-        "win",
-        "iran",
-        "march",
-        "ceasefire",
-        "presidential",
-        "nomination",
-        "netanyahu",
-        "out",
-        "alexandria",
-        "ocasio-cortez",
-        "democratic",
-        "republican",
-        "vance",
-        "duke",
-        "blue"
+        "alexandria ocasio-cortez",
+        "duke blue"
       ],
       "whitelist_topic_keys": [
         "geopolitics",
         "sports",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "politics",
+        "us-politics",
+        "diplomacy-ceasefire",
+        "iran-ceasefire",
+        "geopolitics",
+        "israel",
+        "lebanon"
       ]
     },
     {
@@ -381,17 +404,8 @@
       "ratio": 0.59,
       "level": "B",
       "blacklist_token_keys": [
-        "april",
-        "march",
-        "iran",
-        "israel",
-        "strike",
-        "ceasefire",
-        "out",
         "houthi",
         "yemen",
-        "trump",
-        "oil",
         "netanyahu",
         "vance"
       ],
@@ -399,6 +413,12 @@
         "geopolitics",
         "us-politics",
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "oil",
+        "macro",
+        "trump-iran",
+        "u-s-x-iran"
       ]
     },
     {
@@ -406,35 +426,20 @@
       "ratio": 0.5,
       "level": "B",
       "blacklist_token_keys": [
-        "fed",
-        "win",
-        "michigan",
-        "tournament",
-        "league",
-        "premier",
-        "english",
-        "ncaa",
-        "devils",
-        "duke",
-        "blue",
-        "scorer",
-        "presidential",
-        "nomination",
-        "republican",
-        "tucker",
-        "carlson",
-        "democratic",
-        "gavin",
-        "newsom",
-        "cuts",
-        "rate",
-        "happen",
+        "tucker carlson",
+        "gavin newsom",
         "eurovision"
       ],
       "whitelist_topic_keys": [
         "sports",
         "us-politics",
         "macro"
+      ],
+      "buy_block_topic_keys": [
+        "games",
+        "spreads",
+        "counter-strike-2",
+        "nba-2026"
       ]
     },
     {
@@ -442,32 +447,24 @@
       "ratio": 0.47,
       "level": "B",
       "blacklist_token_keys": [
-        "march",
-        "iran",
-        "april",
-        "june",
-        "forces",
-        "enter",
-        "iranian",
-        "ceasefire",
-        "fall",
-        "regime",
-        "out",
-        "netanyahu",
-        "win",
-        "election",
         "harris",
         "kamala",
-        "presidential",
-        "elections",
-        "launch",
-        "tournament",
-        "between"
+        "netanyahu"
       ],
       "whitelist_topic_keys": [
         "geopolitics",
         "sports",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "politics",
+        "us-politics",
+        "iran",
+        "geopolitics",
+        "diplomacy-ceasefire",
+        "iran-ceasefire",
+        "israel",
+        "trump"
       ]
     },
     {
@@ -476,20 +473,16 @@
       "level": "C",
       "blacklist_token_keys": [
         "lol",
-        "winner",
-        "gaming",
-        "group",
-        "bo5",
-        "game",
-        "first",
-        "stand",
         "bilibili",
-        "lyon",
-        "esports",
-        "team"
+        "lyon esports"
       ],
       "whitelist_topic_keys": [
         "sports"
+      ],
+      "buy_block_topic_keys": [
+        "nba",
+        "basketball",
+        "nba-2026"
       ]
     },
     {
@@ -497,34 +490,31 @@
       "ratio": 0.55,
       "level": "B",
       "blacklist_token_keys": [
-        "april",
-        "iran",
-        "trump",
-        "march",
-        "military",
-        "against",
-        "leadership",
-        "change",
-        "talk",
-        "end",
-        "corina",
-        "machado",
-        "top",
-        "presidential",
-        "mario",
-        "galaxy",
-        "super",
-        "movie",
-        "grossing",
+        "corina machado",
+        "mario galaxy",
         "philippe",
-        "french",
-        "douard",
-        "apple",
-        "app"
+        "apple app",
+        "starmer",
+        "angela rayner",
+        "wes streeting"
       ],
       "whitelist_topic_keys": [
         "us-politics",
         "geopolitics"
+      ],
+      "buy_block_topic_keys": [
+        "india",
+        "indian-elections",
+        "main-election",
+        "bc",
+        "british-columbia",
+        "conservative",
+        "uk-politics",
+        "starmer",
+        "keir",
+        "angela-rayner",
+        "wes-streeting",
+        "grooming-gangs"
       ]
     },
     {
@@ -532,50 +522,27 @@
       "ratio": 0.52,
       "level": "B",
       "blacklist_token_keys": [
-        "iran",
-        "march",
-        "trump",
-        "military",
-        "april",
-        "end",
-        "against",
-        "ceasefire",
-        "israel",
-        "action",
-        "announces",
-        "nato",
-        "win",
-        "nba",
-        "days",
-        "last",
-        "more",
-        "luka",
-        "mvp",
-        "doncic",
-        "finals",
-        "knicks",
-        "new",
-        "york",
         "bryan johnson",
-        "sex",
-        "again this month",
-        "celebrity",
-        "dating",
-        "divorce",
-        "break up",
-        "breakup",
+        "onlyfans",
         "pregnant",
         "wedding",
         "engaged",
-        "girlfriend",
-        "boyfriend",
-        "wife",
-        "husband",
-        "onlyfans"
+        "divorce",
+        "breakup"
       ],
       "whitelist_topic_keys": [
         "sports",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "nuclear",
+        "us-x-iran-diplomatic-meeting",
+        "khamenei",
+        "enrichment-of-uranium",
+        "10-point",
+        "agreement",
+        "ceasefire",
+        "unrestricted-shipping"
       ]
     },
     {
@@ -583,22 +550,21 @@
       "ratio": 0.51,
       "level": "B",
       "blacklist_token_keys": [
-        "iran",
-        "april",
-        "ceasefire",
-        "december",
-        "forces",
-        "enter",
-        "russia",
-        "capture",
-        "june",
-        "all",
-        "kostyantynivka",
-        "trump"
+        "kostyantynivka"
       ],
       "whitelist_topic_keys": [
         "geopolitics",
         "us-politics"
+      ],
+      "buy_block_topic_keys": [
+        "ukraine-peace-deal",
+        "foreign-policy",
+        "trump-zelenskyy",
+        "trump-zelensky",
+        "10-point",
+        "agreement",
+        "ukraine",
+        "world"
       ]
     },
     {
@@ -606,87 +572,72 @@
       "ratio": 0.45,
       "level": "B",
       "blacklist_token_keys": [
-        "hit",
-        "high",
-        "crude",
-        "oil",
-        "april",
-        "wti",
-        "win",
         "raiders",
-        "masters",
-        "bryson",
-        "tournament",
-        "dechambeau",
-        "world",
-        "championship",
-        "nfl",
-        "league",
+        "bryson dechambeau",
         "vikings",
-        "minnesota",
-        "nba",
-        "classic",
-        "baseball",
-        "series",
-        "new"
+        "minnesota"
       ],
       "whitelist_topic_keys": [
         "crypto",
         "us-politics",
         "macro"
+      ],
+      "buy_block_topic_keys": [
+        "weekly",
+        "amazon-hit-price-weekly",
+        "amzn"
       ]
     },
     {
       "address": "0x9c95df82fe2f55f522cee739cefb08f528dded41",
-      "ratio": 0.32,
+      "ratio": 0.15,
       "level": "C",
       "blacklist_token_keys": [
-        "win",
         "heavyweight",
-        "milan",
         "prelims",
-        "madrid",
-        "warriors",
-        "real",
-        "timberwolves",
-        "spurs",
-        "nuggets",
-        "pistons",
-        "hawks",
-        "bayern",
-        "nchen"
+        "win on 20"
       ],
-      "whitelist_topic_keys": []
+      "whitelist_topic_keys": [],
+      "buy_block_topic_keys": [
+        "sports",
+        "soccer",
+        "football",
+        "epl",
+        "premier-league",
+        "laliga",
+        "serie-a",
+        "bundesliga",
+        "ligue-1",
+        "champions-league",
+        "ucl",
+        "nhl",
+        "hockey",
+        "nba",
+        "basketball",
+        "ufc",
+        "mma",
+        "moneyline"
+      ]
     },
     {
       "address": "0x80a4552cdcde3b861b8adc146ab1fbd4711022cc",
-      "ratio": 0.36,
-      "level": "C",
+      "ratio": 0.4,
+      "level": "B",
       "blacklist_token_keys": [
-        "iran",
-        "april",
-        "ceasefire",
-        "december",
-        "enter",
-        "forces",
-        "fed",
-        "spread",
-        "bound",
         "parliamentary",
-        "duke",
-        "devils",
-        "world",
-        "cup",
-        "fifa",
-        "brazil",
-        "trump",
-        "inflation",
-        "increase",
-        "july"
+        "duke devils",
+        "fifa brazil"
       ],
-      "whitelist_topic_keys": []
+      "whitelist_topic_keys": [],
+      "buy_block_topic_keys": [
+        "trump-cabinet",
+        "nuclear",
+        "nuclear-deal",
+        "equities"
+      ]
     }
   ],
+  "enable_target_whitelist": false,
   "default_target_level": "A",
   "target_level_skip_ratios": {
     "A": 0.0,
